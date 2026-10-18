@@ -85,6 +85,17 @@ func (a *app) cmdStop(_ context.Context, _ *pluginsdk.Host, req pluginsdk.Comman
 	return result(msg, runJSON{Thread: t.ID, Dir: t.WorktreePath, Stopped: &stopped})
 }
 
+func (a *app) cmdSendFailures(ctx context.Context, h *pluginsdk.Host, req pluginsdk.CommandRequest) (pluginsdk.CommandResult, error) {
+	t, err := a.threadFor(req)
+	if err != nil {
+		return pluginsdk.CommandResult{}, err
+	}
+	if _, err := a.sendFailures(ctx, h, t, -1, -1); err != nil {
+		return pluginsdk.CommandResult{}, err
+	}
+	return result("Sent the failing tests to Claude", runJSON{Thread: t.ID, Dir: t.WorktreePath})
+}
+
 // validCommand checks a test command typed by the user: one line, not too long.
 func validCommand(cmd string) (string, error) {
 	cmd = strings.TrimSpace(cmd)

@@ -1,7 +1,7 @@
 {
   "name": "test-watcher",
   "displayName": "Test Watcher",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Runs the project's tests in a thread's worktree whenever files change, shows failures and output in the side panel, flags the thread while tests fail, and sends failures to Claude.",
   "protocol": 1,
   "exec": ["bin/test-watcher"],
@@ -9,6 +9,7 @@
     "commands": ["thread.send"],
     "events": ["project", "threads"],
     "threadStatus": true,
+    "terminals": true,
     "secrets": false
   },
   "commands": [
@@ -35,6 +36,13 @@
         { "name": "command", "positional": true, "description": "The test command, e.g. \"go test ./...\" (empty: the detected default)" },
         { "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }
       ]
+    },
+    {
+      "name": "send-failures",
+      "title": "Send Test Failures to Claude",
+      "description": "Send the failing tests of the thread's worktree (the latest failing run: the tests, the command and the last output lines) to Claude in the thread.",
+      "when": "thread && project.git",
+      "args": [{ "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }]
     },
     {
       "name": "toggle-watch",

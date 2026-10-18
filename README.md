@@ -10,9 +10,13 @@ a **Tests** tab of the thread's side panel:
   a *Watch for changes* switch (per thread, on by default) and a form to set the
   project's test command.
 - **Failures**: the failing tests parsed from `go test`, vitest and jest output, each with
-  a *Send to Claude* button. Other runners: the run's exit status and a pointer to Output.
-- **Output**: the run's output, streamed live, failures in red and warnings in amber (the
-  last 2,000 lines / 256 KB; the head is cut first).
+  its package or file and a *Send to Claude* button. Other runners: the run's exit status
+  and a pointer to Output.
+- **Output**: the run in a real terminal (Code Foundry's terminal view, with *Open in
+  bottom panel*); it stays after the run ends, until the next run replaces it. On a Code
+  Foundry without plugin terminals (or when the worktree is outside your home folder):
+  the output streamed live into a log, failures in red and warnings in amber (the last
+  2,000 lines / 256 KB; the head is cut first).
 - Actions: **Run now**, **Stop** while a run is going, **Send failures to Claude**: a
   message of at most 4 KB (the command, the failing tests, the last 60 output lines)
   asking Claude in that thread to fix them.
@@ -22,8 +26,12 @@ failing: TestAdd"); opening the thread or the next passing run clears it.
 
 How it runs: 2 s after files stop changing (debounced), one run per worktree at a time;
 a newer change stops the run in progress (its whole process group) and starts again. The
-command runs in the worktree with your login shell (`$SHELL -lc`), with `CI=true` and
-colours off.
+command runs in the worktree with your login shell (`$SHELL -lc`) and `CI=true` (no watch
+modes). In a terminal it runs under `script(1)`, which records what the terminal shows into
+the plugin's data folder: that is where the failures list, the flag and *Send failures to
+Claude* read the output from, colours stripped. Stop signals the run's process group, so
+the terminal keeps the output up to the stop. Without a terminal it runs as the plugin's
+own child with colours off.
 
 The test command is guessed from the worktree: `go.mod` → `go test ./...`,
 `package.json` → `npm test`, a `Makefile` with a `test:` target → `make test`,
@@ -37,12 +45,9 @@ restarts) until it is archived or removed, or you switch watching off for it.
 ## Install
 
 ```
-code-foundry plugin install test-watcher
+code-foundry plugin install test-watcher --enable
+code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.1.1 --enable   # a release directly
 ```
-
-(Installing from the registry arrives in a later Code Foundry version. Until then:
-download a release tarball for your Mac, unpack it, and run
-`code-foundry plugin dev <unpacked folder> --yes`.)
 
 ## Permissions and why
 
@@ -51,10 +56,12 @@ download a release tarball for your Mac, unpack it, and run
 | `commands: thread.send` | *Send to Claude* and *Send failures to Claude* post the failure excerpt into the thread. Nothing else is invoked. |
 | `events: project, threads` | `project`: worktree changes (status counts, commits, branch switches) and removed worktrees. `threads`: which worktree and project each thread works in, and when a thread is archived or removed. |
 | `threadStatus` | The red "Tests failing" flag on the thread while its tests fail. |
+| `terminals` | The Output tab's terminal: each run is a terminal the plugin owns, in the thread's worktree. Disabling the plugin closes them. |
 
 No secrets, no session environment, no API access. The plugin keeps its settings (test
 commands per project, watched threads, threads with watching off) in
-`~/.code-foundry/plugin-data/test-watcher/settings.json`.
+`~/.code-foundry/plugin-data/test-watcher/settings.json`, and the latest terminal run's
+recorded output per worktree in `runs/` beside it.
 
 ## Commands
 
@@ -65,6 +72,7 @@ Each takes the thread from the context (`--context-thread <id>`, the GUI's selec
 code-foundry plugin test-watcher run              # run now (replaces a run in progress)
 code-foundry plugin test-watcher stop             # stop the run in progress
 code-foundry plugin test-watcher set-command "go test -count=1 ./..."   # "" = back to the guess
+code-foundry plugin test-watcher send-failures    # the failing tests to Claude in the thread
 code-foundry plugin test-watcher toggle-watch     # watching on/off for the thread
 code-foundry plugin test-watcher show tests       # open the Tests tab in the app
 ```
@@ -86,17 +94,40 @@ make dist                                               # release tarballs + SHA
 
 The tests cover the debounce and newest-wins (process groups included), the `go test`,
 vitest and jest parsers on captured output (`testdata/`), the views for failing and
-passing runs, output streaming and caps, the flag lifecycle, the 4 KB excerpt, the
-command form and the edge states (no command, command not found, worktree deleted).
+passing runs, output streaming and caps, terminal runs against plugintest's fake
+terminals (the argv, the recorded output, the exit status, replacing and stopping), the
+flag lifecycle, the 4 KB excerpt, the command form and the edge states (no command,
+command not found, worktree deleted).
 
 Worktree events only fire when a worktree's status counts change, so an edit to a file
 that is already modified does not produce one. The plugin also fingerprints each watched
 worktree every 2 s (`git status` plus size and mtime of each changed file) to catch those.
 
-The Output tab is one node (`outputNode` in `surface.go`): when Code Foundry renders
-plugin-owned terminals, it becomes a `terminal` node and the run moves into it.
+The Output tab is one node (`outputNode` in `surface.go`): a `terminal` node while the
+run's terminal is open, else the log node.
 
-### A real run (Code Foundry dev build, isolated home, a scratch Go module)
+### A real run, 0.1.1 (Code Foundry dev build 73685d8b, isolated home, a scratch Go module)
+
+```
+$ code-foundry plugin test-watcher run --thread s-9dac5b289495
+Running `go test ./...` in /Users/alex/.cf-plugfix/scratch/calc
+$ code-foundry plugin act test-watcher tests tab --key tab-output --thread s-9dac5b289495
+$ code-foundry plugin surface test-watcher tests --thread s-9dac5b289495
+header pill: failing · tabs: Status | Failures(2) | Output*
+node output-terminal {"terminal": {"terminalId": "t-d9c6b3aa70bd", "title": "go test ./...", "height": "fill"}}
+$ code-foundry plugin terminals test-watcher
+t-d9c6b3aa70bd  exited (1)  go test ./...  script  /Users/alex/.cf-plugfix/scratch/calc
+$ code-foundry thread flags s-9dac5b289495
+test-watcher  error  Tests failing: TestAdd and 1 more
+$ code-foundry plugin test-watcher send-failures --thread s-9dac5b289495
+Sent the failing tests to Claude
+$ # a 60 s run, stopped: the group dies, the terminal stays with its output
+t-dcb02521c7cb  exited (15)  echo slow start; sleep 60; go test ./...
+$ # Claude fixed calc.go; the watcher's run in a new terminal passed and cleared the flag
+t-a9b722e3770f  exited (0)  go test ./...
+```
+
+### A real run, 0.1.0 (Code Foundry dev build, isolated home, a scratch Go module)
 
 ```
 $ code-foundry project add ~/cf-scratch/tw-scratch
@@ -120,6 +151,27 @@ header: tw-scratch @ main [passing] took 129ms · just now
 $ code-foundry thread flags s-f9b8cf835989
 thread test watcher run (s-f9b8cf835989) has no flags
 ```
+
+## Changelog
+
+### 0.1.1
+
+- **Asks for one more permission, `terminals`**: the Output tab now shows the run in a
+  real terminal (with *Open in bottom panel*) instead of a log. Because the permissions
+  grew, updating from 0.1.0 disables the plugin until you agree again
+  (`code-foundry plugin enable test-watcher` lists what it asks for). A Code Foundry
+  without plugin terminals keeps the log.
+- The Failures list shows each test's package or file again (it was a dense list, which
+  hides a row's second line).
+- *Send failures to Claude* is also a command (`send-failures`, in the palette); the
+  view's buttons are commands the app runs with the panel's thread.
+- Icons only from the set Code Foundry draws (`folder-x` drew a plain circle).
+- Built against the Code Foundry SDK at 73685d8b; CI runs vet and race tests on every
+  push and pull request; `make registry-entry` writes the registry entry.
+
+### 0.1.0
+
+- First release.
 
 ## License
 

@@ -22,6 +22,7 @@ const (
 
 	maxFailureRows = 100
 	logKey         = "output-log"
+	termKey        = "output-terminal"
 	logRenderBytes = 60 << 10 // under the 64 KB a render may carry
 )
 
@@ -248,11 +249,11 @@ func buildView(m model) ui.View {
 	v := ui.View{Header: header(m)}
 	switch {
 	case m.dir == "":
-		v.Nodes = []ui.Node{{Key: "no-worktree", Empty: &ui.Empty{Glyph: ui.IconGlyph("folder-x", ui.ToneMuted),
+		v.Nodes = []ui.Node{{Key: "no-worktree", Empty: &ui.Empty{Glyph: ui.IconGlyph("folder", ui.ToneMuted),
 			Title: "No worktree", Body: ui.Plain("This thread has no project checkout to run tests in.")}}}
 		return v
 	case m.gone:
-		v.Nodes = []ui.Node{{Key: "gone", Notice: &ui.Notice{Tone: ui.ToneError, Icon: "folder-x", Title: "Worktree deleted",
+		v.Nodes = []ui.Node{{Key: "gone", Notice: &ui.Notice{Tone: ui.ToneError, Icon: "triangle-alert", Title: "Worktree deleted",
 			Body: ui.Spans(ui.T(m.dir).AsMono(), ui.T(" no longer exists, so its tests no longer run.")),
 		}}}
 		return v
@@ -295,7 +296,7 @@ func header(m model) *ui.Header {
 		h.Subline = ui.Plain("no run yet")
 	}
 	if m.dir != "" && !m.gone && m.command != "" {
-		h.Actions = []ui.Button{ui.CommandButton("hdr-run", "Run now", "plugin.test-watcher.run", map[string]string{"thread": m.thread}).WithIcon("play").AsIconOnly()}
+		h.Actions = []ui.Button{ui.CommandButton("hdr-run", "Run now", "plugin.test-watcher.run", nil).WithIcon("play").AsIconOnly()}
 	}
 	return h
 }
@@ -363,13 +364,15 @@ func failing(m model) *runSnap {
 
 func actionsBar(m model) ui.Node {
 	running := m.cur != nil && m.cur.State == stateRunning
-	buttons := []ui.Button{ui.CommandButton("run-now", "Run now", "plugin.test-watcher.run", map[string]string{"thread": m.thread}).WithIcon("play")}
+	// Command buttons: the host fills each command's thread arg from the panel.
+	buttons := []ui.Button{ui.CommandButton("run-now", "Run now", "plugin.test-watcher.run", nil).WithIcon("play")}
 	if running {
-		buttons = append(buttons, ui.CommandButton("stop", "Stop", "plugin.test-watcher.stop", map[string]string{"thread": m.thread}).
+		buttons = append(buttons, ui.CommandButton("stop", "Stop", "plugin.test-watcher.stop", nil).
 			WithIcon("square").WithStyle(ui.ButtonDestructive))
 	}
 	if failing(m) != nil {
-		buttons = append(buttons, ui.EventButton("send-failures", "Send failures to Claude", "send-failures").WithIcon("send").WithStyle(ui.ButtonAttention))
+		buttons = append(buttons, ui.CommandButton("send-failures", "Send failures to Claude", "plugin.test-watcher.send-failures", nil).
+			WithIcon("send").WithStyle(ui.ButtonAttention))
 	}
 	return ui.NewActions("bar", buttons...)
 }
@@ -500,11 +503,12 @@ func failuresNodes(m model) []ui.Node {
 			Actions: []ui.Button{ui.EventButton("send-"+strconv.Itoa(i), "Send to Claude", "send-failure").
 				WithData(fmt.Sprintf("%d:%d", rn.ID, i)).WithIcon("send").AsIconOnly()}}
 		if f.Where != "" {
+			// Line 2, so the list is not dense (a dense row hides it).
 			row.Line2 = ui.Spans(ui.T(truncRunes(f.Where, ui.MaxLabel)).AsMono())
 		}
 		rows = append(rows, row)
 	}
-	nodes = append(nodes, ui.Node{Key: "failures", List: &ui.List{Rows: rows, Dense: true}})
+	nodes = append(nodes, ui.Node{Key: "failures", List: &ui.List{Rows: rows}})
 	if len(rn.Failures) > maxFailureRows {
 		nodes = append(nodes, ui.NewText("more", ui.Plain(fmt.Sprintf("and %d more: see Output", len(rn.Failures)-maxFailureRows))))
 	}
@@ -518,10 +522,14 @@ func outputNodes(m model) []ui.Node {
 	return []ui.Node{outputNode(m.cur)}
 }
 
-// outputNode is the run's output. It is a log node the plugin streams lines into; when
-// hosts render plugin-owned terminals (`terminal` node, permission terminals) this one
-// node becomes ui.NewTerminal("output", id) and the run moves into that terminal.
+// outputNode is the run's output: the terminal it runs in (the host's terminal view,
+// with "Open in bottom panel"), or, when the run is not in a terminal (a host without
+// plugin terminals, the permission not granted, a worktree outside the home folder,
+// or its terminal closed), a log node the plugin streams the lines into.
 func outputNode(rn *runSnap) ui.Node {
+	if rn.Terminal != "" && rn.TermOpen {
+		return ui.Node{Key: termKey, Terminal: &ui.Terminal{TerminalID: rn.Terminal, Title: truncRunes(rn.Command, 80), Height: ui.HeightFill}}
+	}
 	return ui.Node{Key: logKey, Log: &ui.Log{Title: rn.Command, Rows: 24, Wrap: true}}
 }
 
@@ -583,8 +591,8 @@ func (s *testsSurface) Act(ctx context.Context, act pluginsdk.SurfaceAct) error 
 			s.formReset++
 		}
 		s.mu.Unlock()
-	case "send-failures":
-		if err := s.sendFailures(ctx, t, -1, -1); err != nil {
+	case "send-failures": // an older view's button; the view now runs the command
+		if _, err := s.a.sendFailures(ctx, s.h, t, -1, -1); err != nil {
 			return err
 		}
 	case "send-failure":
@@ -592,9 +600,11 @@ func (s *testsSurface) Act(ctx context.Context, act pluginsdk.SurfaceAct) error 
 		if _, err := fmt.Sscanf(act.Data, "%d:%d", &id, &i); err != nil {
 			return fmt.Errorf("bad failure %q", act.Data)
 		}
-		if err := s.sendFailures(ctx, t, id, i); err != nil {
+		what, err := s.a.sendFailures(ctx, s.h, t, id, i)
+		if err != nil {
 			return err
 		}
+		_ = s.h.ToastIn(s.inst, pluginsdk.ToastInfo, "Sent "+truncRunes(what, 120)+" to Claude")
 	default:
 		return fmt.Errorf("unknown action %q", act.Action)
 	}
@@ -612,23 +622,26 @@ func (s *testsSurface) threadInfo() threadInfo {
 }
 
 // sendFailures sends a failing run to Claude in the thread: every failure (run < 0) or
-// failure i of run id.
-func (s *testsSurface) sendFailures(ctx context.Context, t threadInfo, id, i int) error {
-	r := s.a.existingRunner(s.workdir())
+// failure i of run id. It returns what it sent ("the failures" or the test's name).
+func (a *app) sendFailures(ctx context.Context, h *pluginsdk.Host, t threadInfo, id, i int) (string, error) {
+	r := a.existingRunner(t.WorktreePath)
 	if r == nil {
-		return fmt.Errorf("no test run to send")
+		return "", pluginsdk.NewError(pluginsdk.CodeUnavailable, "no test run to send")
 	}
 	var rn *runSnap
 	if id < 0 {
-		m := s.model()
-		if f := failing(m); f != nil {
+		cur, result, _, _ := r.snapshot(false)
+		if f := failing(model{cur: cur, result: result}); f != nil {
 			rn = r.findRun(f.ID)
+		}
+		if rn == nil {
+			return "", pluginsdk.NewError(pluginsdk.CodeUnavailable, "the tests are not failing")
 		}
 	} else {
 		rn = r.findRun(id)
 	}
 	if rn == nil {
-		return fmt.Errorf("that run is gone: run the tests again")
+		return "", pluginsdk.NewError(pluginsdk.CodeUnavailable, "that run is gone: run the tests again")
 	}
 	lines := make([]string, 0, len(rn.Lines))
 	for _, l := range rn.Lines {
@@ -637,7 +650,7 @@ func (s *testsSurface) sendFailures(ctx context.Context, t threadInfo, id, i int
 	fails, count := rn.Failures, rn.FailedCount
 	if id >= 0 {
 		if i < 0 || i >= len(rn.Failures) {
-			return fmt.Errorf("that failure is gone: run the tests again")
+			return "", pluginsdk.NewError(pluginsdk.CodeUnavailable, "that failure is gone: run the tests again")
 		}
 		fails, count = rn.Failures[i:i+1], 1
 		if own := failureLines(rn.Failures[i], lines); len(own) > 0 {
@@ -645,13 +658,11 @@ func (s *testsSurface) sendFailures(ctx context.Context, t threadInfo, id, i int
 		}
 	}
 	text := excerpt(rn.Command, fails, count, lines)
-	if _, err := s.h.Invoke(ctx, "thread.send", map[string]string{"text": text}, pluginsdk.UiContext{ThreadID: t.ID}); err != nil {
-		return fmt.Errorf("sending to Claude: %w", err)
+	if _, err := h.Invoke(ctx, "thread.send", map[string]string{"text": text}, pluginsdk.UiContext{ThreadID: t.ID}); err != nil {
+		return "", fmt.Errorf("sending to Claude: %w", err)
 	}
-	what := "the failures"
 	if id >= 0 {
-		what = fails[0].Name
+		return fails[0].Name, nil
 	}
-	_ = s.h.ToastIn(s.inst, pluginsdk.ToastInfo, "Sent "+truncRunes(what, 120)+" to Claude")
-	return nil
+	return "the failures", nil
 }

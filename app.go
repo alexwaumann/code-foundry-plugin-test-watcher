@@ -18,6 +18,8 @@ type config struct {
 	poll     time.Duration // how often watched worktrees are fingerprinted; 0: never
 	now      func() time.Time
 	shell    func() (string, string) // the shell and its flag that run the command
+	home     func() string           // the home directory (terminal runs need the worktree under it)
+	termPoll time.Duration           // how often a terminal run's output and state are read
 }
 
 func defaultConfig() config {
@@ -26,6 +28,8 @@ func defaultConfig() config {
 		poll:     2 * time.Second,
 		now:      time.Now,
 		shell:    loginShell,
+		home:     func() string { home, _ := os.UserHomeDir(); return home },
+		termPoll: 200 * time.Millisecond,
 	}
 }
 
@@ -112,10 +116,11 @@ func (a *app) plugin() pluginsdk.Plugin {
 		OnEvent:  a.onEvent,
 		Shutdown: a.shutdown,
 		Commands: map[string]pluginsdk.CommandFunc{
-			"run":          a.cmdRun,
-			"stop":         a.cmdStop,
-			"set-command":  a.cmdSetCommand,
-			"toggle-watch": a.cmdToggleWatch,
+			"run":           a.cmdRun,
+			"stop":          a.cmdStop,
+			"set-command":   a.cmdSetCommand,
+			"toggle-watch":  a.cmdToggleWatch,
+			"send-failures": a.cmdSendFailures,
 		},
 		Surfaces: map[string]pluginsdk.SurfaceFactory{"tests": a.openTests},
 	}
@@ -134,7 +139,8 @@ func (a *app) init(ctx context.Context, h *pluginsdk.Host) error {
 		}
 	}
 	a.mu.Unlock()
-	h.Log().Info("test-watcher is up", "host", h.HostVersion(), "dev", h.Dev(), "followed", len(st.followed()))
+	h.Log().Info("test-watcher is up", "host", h.HostVersion(), "dev", h.Dev(), "followed", len(st.followed()), "terminals", terminalsUsable(h))
+	a.closeStaleTerminals(ctx, h)
 	// threads: which worktree and project each thread works in, and when one goes away;
 	// project: worktree changes (a file changed, a commit, a branch switch) and removals.
 	if _, err := h.Subscribe(ctx, "threads", "project"); err != nil {

@@ -57,6 +57,11 @@ type run struct {
 	Problem string
 	// Superseded: a newer run replaced this one (it is not a result).
 	Superseded bool
+	// Terminal is the plugin terminal the run executes in ("" when it runs as a plain
+	// process); TermOpen while the terminal exists (a stop that had to close it, or
+	// the user closing it, ends that).
+	Terminal string
+	TermOpen bool
 
 	parser parser
 	lines  []outLine
@@ -81,6 +86,8 @@ type runSnap struct {
 	Format      format
 	Lines       []outLine
 	Dropped     int
+	Terminal    string
+	TermOpen    bool
 }
 
 func (r *run) snap(withLines bool) *runSnap {
@@ -89,7 +96,8 @@ func (r *run) snap(withLines bool) *runSnap {
 	}
 	s := &runSnap{ID: r.ID, Command: r.Command, Trigger: r.Trigger, Started: r.Started, Ended: r.Ended,
 		State: r.State, Exit: r.Exit, Problem: r.Problem, Failures: r.parser.Failures(),
-		FailedCount: r.parser.FailedCount(), Format: r.parser.format, Dropped: r.Dropped}
+		FailedCount: r.parser.FailedCount(), Format: r.parser.format, Dropped: r.Dropped,
+		Terminal: r.Terminal, TermOpen: r.TermOpen}
 	if withLines {
 		s.Lines = append([]outLine(nil), r.lines...)
 	}
@@ -127,6 +135,9 @@ type runner struct {
 	print   map[string]string
 	gone    bool
 	closed  bool
+	// term is the plugin terminal of the latest terminal run, kept open (exited, its
+	// output still on screen) until the next run replaces it.
+	term string
 }
 
 func newRunner(a *app, dir string) *runner {
@@ -258,6 +269,37 @@ func (r *runner) exec(ctx context.Context, rn *run, done chan struct{}) {
 		finish(stateError, 0, "the worktree "+r.dir+" no longer exists")
 		return
 	}
+	var exit int
+	var err error
+	if h := r.a.terminalHost(r.dir); h != nil {
+		exit, err = r.execTerminal(ctx, h, rn)
+		if errors.Is(err, errNoTerminal) { // at the terminal limit, say: run it ourselves
+			r.a.log().Warn("running the tests without a terminal", "dir", r.dir, "err", err)
+			exit, err = r.execProcess(ctx, rn)
+		}
+	} else {
+		exit, err = r.execProcess(ctx, rn)
+	}
+	switch {
+	case err != nil:
+		finish(stateError, 0, "could not start: "+err.Error())
+		return
+	case ctx.Err() != nil:
+		finish(stateStopped, exit, "")
+	case exit == 0:
+		finish(statePassed, 0, "")
+	case exit == 127:
+		finish(stateError, exit, "command not found: "+firstWord(rn.Command)+" (exit 127; is it on your login shell's PATH?)")
+	default:
+		finish(stateFailed, exit, "")
+	}
+	r.a.log().Info("test run ended", "dir", r.dir, "run", rn.ID, "exit", exit, "stopped", ctx.Err() != nil)
+}
+
+// execProcess runs the command as the plugin's own child, its output piped into the
+// run (hosts without plugin terminals). It returns the exit status, or an error when
+// the process did not start.
+func (r *runner) execProcess(ctx context.Context, rn *run) (int, error) {
 	shell, flag := r.a.cfg.shell()
 	cmd := exec.Command(shell, flag, rn.Command)
 	cmd.Dir = r.dir
@@ -265,15 +307,13 @@ func (r *runner) exec(ctx context.Context, rn *run, done chan struct{}) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	pr, pw, err := os.Pipe()
 	if err != nil {
-		finish(stateError, 0, "could not start: "+err.Error())
-		return
+		return 0, err
 	}
 	cmd.Stdout, cmd.Stderr = pw, pw
 	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
-		finish(stateError, 0, "could not start: "+err.Error())
-		return
+		return 0, err
 	}
 	pw.Close()
 	r.a.log().Info("test run started", "dir", r.dir, "run", rn.ID, "command", rn.Command, "pid", cmd.Process.Pid)
@@ -297,24 +337,14 @@ func (r *runner) exec(ctx context.Context, rn *run, done chan struct{}) {
 	pr.Close()
 	// Children left in the group (a test binary's helpers) go with it.
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	exit := 0
 	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		exit = ee.ExitCode()
-	} else if err != nil {
-		exit = -1
-	}
 	switch {
-	case ctx.Err() != nil:
-		finish(stateStopped, exit, "")
-	case exit == 0:
-		finish(statePassed, 0, "")
-	case exit == 127:
-		finish(stateError, exit, "command not found: "+firstWord(rn.Command)+" (exit 127; is it on your login shell's PATH?)")
-	default:
-		finish(stateFailed, exit, "")
+	case errors.As(err, &ee):
+		return ee.ExitCode(), nil
+	case err != nil:
+		return -1, nil
 	}
-	r.a.log().Info("test run ended", "dir", r.dir, "run", rn.ID, "exit", exit, "stopped", ctx.Err() != nil)
+	return 0, nil
 }
 
 // read streams the process's output into the run, line by line.
@@ -323,27 +353,39 @@ func (r *runner) read(src io.Reader, rn *run) {
 	for {
 		line, err := br.ReadString('\n')
 		if line != "" {
-			text := strings.TrimRight(stripANSI(line), "\r\n")
-			// A carriage-return progress line keeps only what was drawn last.
-			if i := strings.LastIndexByte(text, '\r'); i >= 0 {
-				text = text[i+1:]
-			}
-			r.mu.Lock()
-			rn.parser.Line(text)
-			rn.addLine(text, lineTone(text))
-			if r.flush == nil {
-				r.flush = time.AfterFunc(flushPeriod, func() {
-					r.mu.Lock()
-					r.flush = nil
-					r.mu.Unlock()
-					r.a.changed(r.dir)
-				})
-			}
-			r.mu.Unlock()
+			r.output(rn, line)
 		}
 		if err != nil {
 			return
 		}
+	}
+}
+
+// output adds one line of output to the run (parsed for failures) and schedules a
+// render.
+func (r *runner) output(rn *run, line string) {
+	text := strings.TrimRight(stripANSI(line), "\r\n")
+	// A carriage-return progress line keeps only what was drawn last.
+	if i := strings.LastIndexByte(text, '\r'); i >= 0 {
+		text = text[i+1:]
+	}
+	text = strings.Map(func(c rune) rune {
+		if c < ' ' && c != '\t' || c == 0x7f {
+			return -1 // backspaces, bells and other controls a terminal draws
+		}
+		return c
+	}, text)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rn.parser.Line(text)
+	rn.addLine(text, lineTone(text))
+	if r.flush == nil {
+		r.flush = time.AfterFunc(flushPeriod, func() {
+			r.mu.Lock()
+			r.flush = nil
+			r.mu.Unlock()
+			r.a.changed(r.dir)
+		})
 	}
 }
 

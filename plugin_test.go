@@ -68,21 +68,40 @@ func testConfig() config {
 		poll:     0,
 		now:      time.Now,
 		shell:    func() (string, string) { return "/bin/sh", "-c" },
+		home:     func() string { return "" },
+		termPoll: 10 * time.Millisecond,
 	}
 }
 
-func start(t *testing.T, dataDir string) *fixture {
+func start(t *testing.T, dataDir string) *fixture { return startWith(t, dataDir, false) }
+
+// startWith with terminals grants the terminals permission on a host that renders
+// terminal nodes, and puts the worktree under the "home" folder, so runs go into
+// plugin terminals (plugintest's fakes: nothing runs; the test writes the output).
+func startWith(t *testing.T, dataDir string, terminals bool) *fixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
-	f := &fixture{t: t, ctx: ctx, a: newApp(testConfig()), dir: t.TempDir()}
+	home := t.TempDir()
+	cfg := testConfig()
+	cfg.home = func() string { return home }
+	f := &fixture{t: t, ctx: ctx, a: newApp(cfg), dir: filepath.Join(home, "worktree")}
+	if err := os.Mkdir(f.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	granted := pluginsdk.Permissions{Commands: []string{"thread.send"}, Events: []string{"project", "threads"}, ThreadStatus: true}
+	caps := []string{"surfaces", "view.tabs"}
+	if terminals {
+		granted.Terminals = true
+		caps = append(caps, "terminals", "view.node.terminal")
+	}
 	if dataDir == "" {
 		dataDir = t.TempDir()
 	}
 	f.h = plugintest.Start(t, f.a.plugin(), plugintest.Options{
 		Name:    "test-watcher",
 		DataDir: dataDir,
-		Granted: pluginsdk.Permissions{Commands: []string{"thread.send"}, Events: []string{"project", "threads"}, ThreadStatus: true},
+		Granted: granted,
 		Invoke: func(_ context.Context, p pluginsdk.InvokeParams) (pluginsdk.CommandResult, error) {
 			if p.Command != "thread.send" || p.Context.ThreadID != thread {
 				return pluginsdk.CommandResult{}, fmt.Errorf("unexpected %s %+v", p.Command, p.Context)
@@ -92,7 +111,7 @@ func start(t *testing.T, dataDir string) *fixture {
 			f.mu.Unlock()
 			return pluginsdk.CommandResult{Message: "sent"}, nil
 		},
-		Capabilities: []string{"surfaces", "view.tabs"},
+		Capabilities: caps,
 	})
 	t.Cleanup(func() { f.a.shutdown(context.Background(), nil) })
 	f.event(fmt.Sprintf(`{"threadList":{"snapshot":{"threads":[{"id":%q,"projectId":"p1","worktreePath":%q,"name":"fix it"}]}},"epoch":"e"}`, thread, f.dir), true)
@@ -359,20 +378,32 @@ func TestFailingAndPassingViews(t *testing.T) {
 		t.Errorf("header actions = %+v", v.Header.Actions)
 	}
 	bar := node(v, "bar").Actions.Buttons
-	if len(bar) != 2 || bar[1].Key != "send-failures" || bar[1].Style != ui.ButtonAttention {
+	if len(bar) != 2 || bar[1].Key != "send-failures" || bar[1].Style != ui.ButtonAttention ||
+		bar[1].Action.Command == nil || bar[1].Action.Command.Name != "plugin.test-watcher.send-failures" {
 		t.Errorf("actions bar = %+v", bar)
+	}
+	for _, b := range append(bar, v.Header.Actions...) {
+		if b.Action.Command != nil && len(b.Action.Command.Args) > 0 {
+			t.Errorf("%s passes args the host fills from the panel: %v", b.Key, b.Action.Command.Args)
+		}
 	}
 
 	v = f.tab(tabFailures)
-	rows := node(v, "failures").List.Rows
+	list := node(v, "failures").List
+	rows := list.Rows
 	if len(rows) != 1 || rows[0].Title != "TestAdd" || rows[0].Line2.Spans[0].Text != "example.com/calc" {
 		t.Fatalf("failure rows = %+v", rows)
+	}
+	if list.Dense {
+		t.Error("a dense list hides line 2, the package")
 	}
 	if badge := v.Tabs.Items[1].Badge; badge == nil || badge.Label != "1" {
 		t.Errorf("failures badge = %+v", badge)
 	}
 	f.act(pluginsdk.SurfaceAct{Kind: pluginsdk.ActClick, Action: "send-failure", Key: rows[0].Actions[0].Key, Data: rows[0].Actions[0].Action.Data})
-	f.act(pluginsdk.SurfaceAct{Kind: pluginsdk.ActClick, Action: "send-failures", Key: "send-failures"})
+	if res := f.command("send-failures", nil); res.Message != "Sent the failing tests to Claude" {
+		t.Errorf("send-failures = %q", res.Message)
+	}
 	f.mu.Lock()
 	sent := append([]string(nil), f.sent...)
 	f.mu.Unlock()
@@ -578,5 +609,139 @@ func TestRefusals(t *testing.T) {
 	}
 	if _, err := f.h.Command(f.ctx, "run", map[string]string{"thread": "s-nope"}, pluginsdk.UiContext{}); pluginsdk.ErrorCode(err) != pluginsdk.CodeNotFound {
 		t.Errorf("unknown thread: %v", err)
+	}
+}
+
+// The outputFile a terminal run's argv records into.
+func outputFile(t *testing.T, argv []string) string {
+	t.Helper()
+	if len(argv) < 4 || argv[0] != scriptPath || argv[1] != "-q" || argv[2] != "-F" {
+		t.Fatalf("argv = %q", argv)
+	}
+	return argv[3]
+}
+
+// With plugin terminals, a run goes into a terminal in the worktree: the Output tab
+// shows it, the plugin reads what it prints for the failures and the flag, and the
+// exit status from the host; the next run replaces the terminal.
+func TestTerminalRun(t *testing.T) {
+	f := startWith(t, "", true)
+	f.open()
+	f.command("set-command", map[string]string{"command": "go test ./..."})
+	f.command("run", nil)
+	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool { return len(h.CreatedTerminals()) == 1 })
+	spec := f.h.CreatedTerminals()[0]
+	if spec.Cwd != f.dir || spec.Env["CI"] != "true" || spec.Title != "go test ./..." {
+		t.Errorf("terminal spec = %+v", spec)
+	}
+	if n := len(spec.Argv); spec.Argv[n-1] != "go test ./..." || spec.Argv[n-2] != "-c" {
+		t.Errorf("argv = %q", spec.Argv)
+	}
+	term := f.h.PluginTerminals()[0].TerminalID
+
+	v := f.tab(tabOutput)
+	n := node(v, termKey)
+	if n == nil || n.Terminal == nil || n.Terminal.TerminalID != term || node(v, logKey) != nil {
+		t.Fatalf("output tab = %+v", v.Nodes)
+	}
+
+	// What the terminal shows lands in the run (colours and CRLFs as script writes them).
+	out := outputFile(t, spec.Argv)
+	text := "=== RUN   TestAdd\r\n\x1b[31m--- FAIL: TestAdd (0.00s)\x1b[0m\r\n    calc_test.go:9: Add(2, 3) = 6, want 5\r\nFAIL\r\nFAIL\texample.com/calc\t0.01s\r\nFAIL"
+	if err := os.WriteFile(out, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.h.WaitFor(5*time.Second, func(*plugintest.Host) bool {
+		cur, _, _, _ := f.a.existingRunner(f.dir).snapshot(false)
+		return len(cur.Failures) == 1
+	})
+	f.h.ExitTerminal(term, 1)
+	v = f.waitPill("failing")
+	if n := node(v, termKey); n == nil || n.Terminal.TerminalID != term {
+		t.Errorf("the exited terminal left the Output tab: %+v", v.Nodes)
+	}
+	v = f.tab(tabFailures)
+	if rows := node(v, "failures").List.Rows; len(rows) != 1 || rows[0].Title != "TestAdd" || rows[0].Line2.Spans[0].Text != "example.com/calc" {
+		t.Errorf("failure rows = %+v", rows)
+	}
+	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool {
+		fs := h.Flags()
+		return len(fs) == 1 && fs[0].Reason == "Tests failing: TestAdd"
+	})
+	f.command("send-failures", nil)
+	f.mu.Lock()
+	sent := f.sent[len(f.sent)-1]
+	f.mu.Unlock()
+	if !strings.Contains(sent, "--- FAIL: TestAdd (0.00s)") || strings.Contains(sent, "\x1b") || strings.Contains(sent, "\r") {
+		t.Errorf("excerpt:\n%q", sent)
+	}
+
+	// The next run closes the last one's terminal and opens its own; it passes.
+	f.command("run", nil)
+	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool { return len(h.CreatedTerminals()) == 2 })
+	terms := f.h.PluginTerminals()
+	if len(terms) != 1 || terms[0].TerminalID == term {
+		t.Fatalf("terminals after the second run = %+v", terms)
+	}
+	if err := os.WriteFile(outputFile(t, f.h.CreatedTerminals()[1].Argv), []byte("ok  \texample.com/calc\t0.01s\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.h.ExitTerminal(terms[0].TerminalID, 0)
+	f.waitPill("passing")
+	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool {
+		fs := h.Flags()
+		return len(fs) == 2 && fs[1].Level == pluginsdk.FlagNone
+	})
+}
+
+// Stop on a terminal run without a process group to signal (the fake host runs
+// nothing, so no pid) closes the terminal; the Output tab falls back to the log of
+// what the run printed.
+func TestTerminalStop(t *testing.T) {
+	f := startWith(t, "", true)
+	f.open()
+	f.command("set-command", map[string]string{"command": "go test ./..."})
+	f.command("run", nil)
+	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool { return len(h.CreatedTerminals()) == 1 })
+	if err := os.WriteFile(outputFile(t, f.h.CreatedTerminals()[0].Argv), []byte("=== RUN   TestSlow\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.h.WaitFor(5*time.Second, func(*plugintest.Host) bool {
+		cur, _, _, _ := f.a.existingRunner(f.dir).snapshot(true)
+		return len(cur.Lines) == 2
+	})
+	if res := f.command("stop", nil); res.Message != "Stopped the test run" {
+		t.Fatalf("stop = %q", res.Message)
+	}
+	v := f.waitPill("stopped")
+	if len(f.h.PluginTerminals()) != 0 {
+		t.Errorf("terminals after stop = %+v", f.h.PluginTerminals())
+	}
+	v = f.tab(tabOutput)
+	log := node(v, logKey)
+	if log == nil || node(v, termKey) != nil || len(log.Log.Lines) != 2 || log.Log.Lines[1].Text != "=== RUN   TestSlow" {
+		t.Errorf("output after stop = %+v", v.Nodes)
+	}
+}
+
+// The terminals permission alone is not enough: a host without terminal nodes keeps
+// the log node and runs the command itself.
+func TestTerminalNeedsCapability(t *testing.T) {
+	f := startWith(t, "", false)
+	f.a.mu.Lock()
+	h := f.a.h
+	f.a.mu.Unlock()
+	if f.a.terminalHost(f.dir) != nil || terminalsUsable(h) {
+		t.Error("terminal runs without the capability or the permission")
+	}
+	f.open()
+	f.command("set-command", map[string]string{"command": "echo ok"})
+	f.command("run", nil)
+	f.waitPill("passing")
+	if n := node(f.tab(tabOutput), logKey); n == nil {
+		t.Error("no log node")
+	}
+	if len(f.h.CreatedTerminals()) != 0 {
+		t.Error("made a terminal")
 	}
 }
