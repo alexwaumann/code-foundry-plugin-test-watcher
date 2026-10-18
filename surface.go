@@ -68,7 +68,7 @@ func (a *app) openTests(_ context.Context, h *pluginsdk.Host, open pluginsdk.Sur
 
 func (s *testsSurface) Visibility(bool) {}
 
-func (s *testsSurface) Close() {
+func (s *testsSurface) Close(pluginsdk.CloseReason) {
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()

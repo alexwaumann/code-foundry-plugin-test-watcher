@@ -46,7 +46,7 @@ restarts) until it is archived or removed, or you switch watching off for it.
 
 ```
 code-foundry plugin install test-watcher --enable
-code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.1.1 --enable   # a release directly
+code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.1.2 --enable   # a release directly
 ```
 
 ## Permissions and why
@@ -153,6 +153,12 @@ thread test watcher run (s-f9b8cf835989) has no flags
 ```
 
 ## Changelog
+
+### 0.1.2
+
+- Built against the released Code Foundry SDK, `pluginsdk` v0.1.0 (code-foundry
+  `4ed617fd`): the surface's `Close` takes the close reason the host now sends. No
+  behaviour change; same permissions as 0.1.1, so updating keeps it enabled.
 
 ### 0.1.1
 

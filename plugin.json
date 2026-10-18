@@ -1,7 +1,7 @@
 {
   "name": "test-watcher",
   "displayName": "Test Watcher",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Runs the project's tests in a thread's worktree whenever files change, shows failures and output in the side panel, flags the thread while tests fail, and sends failures to Claude.",
   "protocol": 1,
   "exec": ["bin/test-watcher"],
