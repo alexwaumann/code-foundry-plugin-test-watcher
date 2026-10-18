@@ -190,11 +190,20 @@ func (s *testsSurface) render() error {
 		}
 		pending = pending[n:]
 	}
+	// Compare views without the log's lines: a view that only stops carrying the lines
+	// it started the log with is the same view to the host.
+	var lines []ui.LogLine
+	if log := findLog(v.Nodes); log != nil {
+		lines, log.Lines = log.Lines, nil
+	}
 	data, err := json.Marshal(v)
+	if log := findLog(v.Nodes); log != nil {
+		log.Lines = lines
+	}
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(data, s.lastJSON) {
+	if fresh := len(lines) > 0; fresh || !bytes.Equal(data, s.lastJSON) {
 		if err := s.h.UpdateView(s.inst, v); err != nil {
 			s.lastJSON, s.logLive = nil, false
 			return err
