@@ -1,0 +1,38 @@
+PASS ./ok.test.js
+FAIL ./math.test.js
+  ● math › adds
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 3
+    Received: 2
+
+      1 | describe('math', () => {
+    > 2 |   test('adds', () => { expect(1 + 1).toBe(3) })
+        |                                      ^
+      3 |   test('subtracts', () => { expect(2 - 1).toBe(1) })
+      4 | })
+      5 | test('top level fails', () => { expect('a').toBe('b') })
+
+      at Object.toBe (math.test.js:2:38)
+
+  ● top level fails
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: "b"
+    Received: "a"
+
+      3 |   test('subtracts', () => { expect(2 - 1).toBe(1) })
+      4 | })
+    > 5 | test('top level fails', () => { expect('a').toBe('b') })
+        |                                             ^
+      6 |
+
+      at Object.toBe (math.test.js:5:45)
+
+Test Suites: 1 failed, 1 passed, 2 total
+Tests:       2 failed, 2 passed, 4 total
+Snapshots:   0 total
+Time:        0.263 s
+Ran all test suites.

@@ -1,0 +1,48 @@
+{
+  "name": "test-watcher",
+  "displayName": "Test Watcher",
+  "version": "0.1.0",
+  "description": "Runs the project's tests in a thread's worktree whenever files change, shows failures and output in the side panel, flags the thread while tests fail, and sends failures to Claude.",
+  "protocol": 1,
+  "exec": ["bin/test-watcher"],
+  "permissions": {
+    "commands": ["thread.send"],
+    "events": ["project", "threads"],
+    "threadStatus": true,
+    "secrets": false
+  },
+  "commands": [
+    {
+      "name": "run",
+      "title": "Run Tests Now",
+      "description": "Run the project's test command in the thread's worktree now, replacing a run in progress.",
+      "when": "thread && project.git",
+      "args": [{ "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }]
+    },
+    {
+      "name": "stop",
+      "title": "Stop Test Run",
+      "description": "Stop the test run in progress in the thread's worktree.",
+      "when": "thread && project.git",
+      "args": [{ "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }]
+    },
+    {
+      "name": "set-command",
+      "title": "Set Test Command",
+      "description": "Set the command that runs the tests of the thread's project (run in the worktree with your login shell). An empty value goes back to the detected default.",
+      "when": "thread && project.git",
+      "args": [
+        { "name": "command", "positional": true, "description": "The test command, e.g. \"go test ./...\" (empty: the detected default)" },
+        { "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }
+      ]
+    },
+    {
+      "name": "toggle-watch",
+      "title": "Toggle Watching for Test Changes",
+      "description": "Turn running the tests on every file change on or off for the thread.",
+      "when": "thread && project.git",
+      "args": [{ "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }]
+    }
+  ],
+  "surfaces": [{ "id": "tests", "title": "Tests", "icon": "flask-conical", "scope": "thread", "when": "project.git" }]
+}

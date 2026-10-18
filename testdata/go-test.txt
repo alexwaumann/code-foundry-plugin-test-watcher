@@ -1,0 +1,12 @@
+# example.com/cap/c [example.com/cap/c.test]
+c/c_test.go:5:28: undefined: undefinedThing
+--- FAIL: TestTable (0.00s)
+    --- FAIL: TestTable/one (0.00s)
+        a_test.go:11: bad one
+--- FAIL: TestPlain (0.00s)
+    a_test.go:17: boom
+FAIL
+FAIL	example.com/cap/a	0.108s
+ok  	example.com/cap/b	0.108s
+FAIL	example.com/cap/c [build failed]
+FAIL

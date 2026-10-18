@@ -1,0 +1,53 @@
+
+ RUN  v3.2.7 /private/tmp/tw-capture/js
+
+ ✓ src/ok.test.ts (1 test) 1ms
+ ❯ src/math.test.ts (3 tests | 2 failed) 5ms
+   × math > adds 4ms
+     → expected 2 to be 3 // Object.is equality
+   ✓ math > subtracts 0ms
+   × top level fails 1ms
+     → expected 'a' to be 'b' // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/math.test.ts > math > adds
+AssertionError: expected 2 to be 3 // Object.is equality
+
+- Expected
++ Received
+
+- 3
++ 2
+
+ ❯ src/math.test.ts:3:36
+      1| import { describe, it, expect } from 'vitest'
+      2| describe('math', () => {
+      3|   it('adds', () => { expect(1 + 1).toBe(3) })
+       |                                    ^
+      4|   it('subtracts', () => { expect(2 - 1).toBe(1) })
+      5| })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/math.test.ts > top level fails
+AssertionError: expected 'a' to be 'b' // Object.is equality
+
+Expected: "b"
+Received: "a"
+
+ ❯ src/math.test.ts:6:43
+      4|   it('subtracts', () => { expect(2 - 1).toBe(1) })
+      5| })
+      6| it('top level fails', () => { expect('a').toBe('b') })
+       |                                           ^
+      7| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  2 failed | 2 passed (4)
+   Start at  07:37:05
+   Duration  388ms (transform 229ms, setup 0ms, collect 233ms, tests 6ms, environment 0ms, prepare 90ms)
+
