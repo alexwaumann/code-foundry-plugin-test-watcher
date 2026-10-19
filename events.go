@@ -109,6 +109,7 @@ func (a *app) onThreads(e event) {
 					delete(s.Threads, id)
 					delete(s.Unwatched, id)
 					delete(s.FlagSets, id)
+					delete(s.WakeOnly, id)
 				}
 			}); err != nil {
 				a.log().Warn("saving settings", "err", err)

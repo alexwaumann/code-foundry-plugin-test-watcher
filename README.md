@@ -19,7 +19,8 @@ a **Tests** tab of the thread's side panel:
   2,000 lines / 256 KB; the head is cut first).
 - Actions: **Run now**, **Clear flag** while the thread is flagged, **Stop** while a run
   is going, **Send failures to Claude**: a message of at most 4 KB (the command, the
-  failing tests, the last 60 output lines) asking Claude in that thread to fix them.
+  failing tests, the last 60 output lines) asking Claude in that thread to fix them,
+  ending with the line that waits for the next run (below).
 
 While the tests fail the thread is flagged red in the sidebar ("Test Watcher: Tests
 failing: TestAdd"). The flag stays when you open the thread: it says the tests are still
@@ -39,11 +40,15 @@ Run now flags the thread.
 How it runs: 2 s after files stop changing (debounced), one run per worktree at a time;
 a newer change stops the run in progress (its whole process group) and starts again. The
 command runs in the worktree with your login shell (`$SHELL -lc`) and `CI=true` (no watch
-modes). In a terminal it runs under `script(1)`, which records what the terminal shows into
-the plugin's data folder: that is where the failures list, the flag and *Send failures to
-Claude* read the output from, colours stripped. Stop signals the run's process group, so
-the terminal keeps the output up to the stop. Without a terminal it runs as the plugin's
-own child with colours off.
+modes). In a terminal, the plugin reads the terminal's whole output, its scrollback and
+screen (Code Foundry keeps the last 10,000 rows by default; the plugin reads at most the
+last 1 MB), every second while it runs and once more when the terminal says the command
+exited, with its exit status: that is what the failures list, the flag and *Send
+failures to Claude* use, colours stripped. On a Code Foundry that cannot read a
+terminal's scrollback (before pluginsdk v0.2.0) it runs under `script(1)` instead, which
+records what the terminal shows into the plugin's data folder. Stop signals the run's
+process group, so the terminal keeps the output up to the stop. Without a terminal it runs
+as the plugin's own child with colours off.
 
 The test command is guessed from the worktree: `go.mod` → `go test ./...`,
 `package.json` → `npm test`, a `Makefile` with a `test:` target → `make test`,
@@ -52,13 +57,38 @@ The test command is guessed from the worktree: `go.mod` → `go test ./...`,
 
 Which threads are watched: a thread starts being watched the first time its Tests tab is
 opened or one of the commands below runs for it, and stays watched (also across
-restarts) until it is archived or removed, or you switch watching off for it.
+restarts) until it is archived or removed, or you switch watching off for it. A thread
+an agent subscribes to `tests-finished` is watched too, while it has a subscription and
+10 minutes after the last one ended (so an agent that subscribes again after each wake
+misses no change); opening its Tests tab or running a command for it keeps it for good.
+
+## Wake source: tests-finished
+
+An agent waits for the next test run instead of polling (needs Code Foundry with wake
+sources, pluginsdk v0.2.0):
+
+```
+code-foundry thread subscribe --plugin test-watcher/tests-finished [--arg result=fail] [--repeat]
+```
+
+`thread` defaults to the subscribing thread; `--arg thread=<id>` waits on another
+thread's worktree, `--arg result=pass|fail` for one outcome only. The plugin fires it
+after every run in the thread's worktree that ends with a result: passed, failed, or
+could not run (as `fail`); a stopped or replaced run does not. The title reads like `go
+test ./... failed: TestAdd and 1 more`; the payload is `{thread, dir, run, result, state,
+command, exit, trigger, duration_ms, failed_count, failures: [{name, where}], problem}`.
+A subscription waits for the next run: when the files already changed and a run is
+going, that one; `code-foundry plugin test-watcher run` starts one now.
+
+*Send failures to Claude*, the `run` command's result and the end of the Status tab carry
+the `code-foundry thread subscribe --plugin test-watcher/tests-finished --arg thread=<id>`
+line. The flag reason does not (80 characters).
 
 ## Install
 
 ```
 code-foundry plugin install test-watcher --enable
-code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.1.3 --enable   # a release directly
+code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.2.0 --enable   # a release directly
 ```
 
 ## Permissions and why
@@ -72,9 +102,9 @@ code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.1.3 
 
 No secrets, no session environment, no API access. The plugin keeps its settings (test
 commands per project, watched threads, threads with watching off, the failing tests each
-flag was raised for) in
+flag was raised for, threads watched only for a wake subscription) in
 `~/.code-foundry/plugin-data/test-watcher/settings.json`, and the latest terminal run's
-recorded output per worktree in `runs/` beside it.
+pid (and, on an older Code Foundry, its recorded output) per worktree in `runs/` beside it.
 
 ## Commands
 
@@ -102,6 +132,7 @@ code-foundry plugin restart test-watcher                # after every rebuild
 code-foundry plugin surface test-watcher tests --context-thread <id>
 code-foundry plugin act test-watcher tests tab --key tab-failures --context-thread <id>
 code-foundry plugin logs test-watcher --lines 50
+code-foundry thread subscribe --id <thread> --plugin test-watcher/tests-finished   # then break a test
 make test                                               # plugintest unit tests
 make dist                                               # release tarballs + SHA256SUMS
 ```
@@ -109,7 +140,9 @@ make dist                                               # release tarballs + SHA
 The tests cover the debounce and newest-wins (process groups included), the `go test`,
 vitest and jest parsers on captured output (`testdata/`), the views for failing and
 passing runs, output streaming and caps, terminal runs against plugintest's fake
-terminals (the argv, the recorded output, the exit status, replacing and stopping), the
+terminals (the argv, the scrollback read and the `script(1)` fallback, the exit status,
+replacing and stopping), the `tests-finished` wake (subscribe, fire, match by result,
+re-arm, letting go after unsubscribing, the hints), the
 flag lifecycle (sticky; cleared by a pass, Stop, watching off or the user; not raised again
 for the same failures, across restarts too), the 4 KB excerpt, the command form and the edge states (no command,
 command not found, worktree deleted).
@@ -120,6 +153,23 @@ worktree every 2 s (`git status` plus size and mtime of each changed file) to ca
 
 The Output tab is one node (`outputNode` in `surface.go`): a `terminal` node while the
 run's terminal is open, else the log node.
+
+### A real run, 0.2.0 (Code Foundry dev build 363eda43, isolated home, a scratch Go module)
+
+```
+$ cf plugin test-watcher run --thread s-75ac72597b7c
+Running `go test ./...` in /Users/alex/.cf-wake-plugins/scratch/calc
+Wait for it to finish: code-foundry thread subscribe --plugin test-watcher/tests-finished --arg thread=s-75ac72597b7c
+$ cf plugin terminals test-watcher           # no script(1): the output is read from the terminal
+t-942c2b74a430  exited (0)  go test ./...  sh  /Users/alex/.cf-wake-plugins/scratch/calc
+$ cf thread subscribe --id s-75ac72597b7c --plugin test-watcher/tests-finished
+subscribed sub-98580fa5a895: s-75ac72597b7c wakes when plugin test-watcher/tests-finished fires (thread=s-75ac72597b7c) (once)
+$ # TestAdd now wants 6; 3 s later:
+log info   tests-finished fired thread=s-75ac72597b7c title=go test ./... failed: TestAdd woke=1
+$ cf thread items --id s-75ac72597b7c
+#1 wake: Test Watcher: tests-finished — go test ./... failed: TestAdd
+#6 claude: The test run is failing because of an uncommitted edit to `calc_test.go`, not because of a bug in `Add`. …
+```
 
 ### A real run, 0.1.3 (Code Foundry dev build 19052860, isolated home, a scratch Go module)
 
@@ -202,6 +252,22 @@ thread test watcher run (s-f9b8cf835989) has no flags
 ```
 
 ## Changelog
+
+### 0.2.0
+
+- **Wake source `tests-finished`** (args `thread`, from the subscriber, and optional
+  `result` pass|fail; scope thread): fires after every run in the thread's worktree with
+  a result, with the failing tests in the payload. Subscribing watches the thread's
+  worktree; a thread watched only for that is let go 10 minutes after its last
+  subscription.
+- *Send failures to Claude*, the `run` result and the Status tab end with the
+  `code-foundry thread subscribe --plugin test-watcher/tests-finished …` line.
+- **No more `script(1)`**: a terminal run's output is read from the terminal itself,
+  scrollback included (`terminal/read` with `scrollback`), and its exit status comes with
+  `terminal/exited`. A Code Foundry without the `terminal.scrollback` capability keeps the
+  `script(1)` recording.
+- Built against pluginsdk v0.2.0 (code-foundry `363eda43`). Same permissions as 0.1.3
+  (a wake source needs none), so updating keeps it enabled.
 
 ### 0.1.3
 

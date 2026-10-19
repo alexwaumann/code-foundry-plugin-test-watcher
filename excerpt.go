@@ -14,9 +14,11 @@ const (
 )
 
 // excerpt frames a failing run as a request to fix it: the command, the failing
-// tests and the output's last lines, at most maxExcerpt bytes. Output lines go first
-// when it is too long, then failures.
-func excerpt(command string, failures []failure, failedCount int, lines []string) string {
+// tests and the output's last lines, then hint (the line that waits for the next run),
+// at most maxExcerpt bytes. Output lines go first when it is too long, then failures.
+func excerpt(command string, failures []failure, failedCount int, lines []string, hint string) string {
+	foot := "\nOr wait for the watcher's next run (it runs the tests when files change) instead of polling:\n" + hint
+	limit := maxExcerpt - len(foot)
 	if len(lines) > excerptLines {
 		lines = lines[len(lines)-excerptLines:]
 	}
@@ -51,15 +53,15 @@ func excerpt(command string, failures []failure, failedCount int, lines []string
 		return b.String()
 	}
 	s := build(fails, lines)
-	for len(s) > maxExcerpt && len(lines) > 0 {
+	for len(s) > limit && len(lines) > 0 {
 		lines = lines[1:]
 		s = build(fails, lines)
 	}
-	for len(s) > maxExcerpt && len(fails) > 1 {
+	for len(s) > limit && len(fails) > 1 {
 		fails = fails[:len(fails)-1]
 		s = build(fails, lines)
 	}
-	return truncBytes(s, maxExcerpt)
+	return truncBytes(s, limit) + foot
 }
 
 // failureLines picks a failure's own lines from the output. For go test: its

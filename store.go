@@ -25,6 +25,9 @@ type settings struct {
 	// stay after the user clears the flag, so the same failures do not raise it again;
 	// a passing run, Stop or watching off forgets them.
 	FlagSets map[string]string `json:"flagSets,omitempty"`
+	// WakeOnly are the followed threads followed only because an agent subscribed them
+	// to tests-finished: they are let go after their last subscription.
+	WakeOnly map[string]bool `json:"wakeOnly,omitempty"`
 }
 
 // store guards settings and writes them through to dir/settings.json.
@@ -67,6 +70,22 @@ func (st *store) flagSet(thread string) string {
 	return st.s.FlagSets[thread]
 }
 
+func (st *store) wakeOnly(thread string) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.s.WakeOnly[thread]
+}
+
+func (st *store) wakeOnlyThreads() []string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := make([]string, 0, len(st.s.WakeOnly))
+	for id := range st.s.WakeOnly {
+		out = append(out, id)
+	}
+	return out
+}
+
 func (st *store) followed() []string {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -92,6 +111,9 @@ func (st *store) update(f func(s *settings)) error {
 	}
 	if st.s.FlagSets == nil {
 		st.s.FlagSets = map[string]string{}
+	}
+	if st.s.WakeOnly == nil {
+		st.s.WakeOnly = map[string]bool{}
 	}
 	f(&st.s)
 	data, err := json.MarshalIndent(st.s, "", "  ")

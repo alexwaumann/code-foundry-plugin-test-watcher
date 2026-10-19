@@ -20,16 +20,24 @@ import (
 // Runs in a plugin terminal (permission terminals). The Output tab then shows the run
 // in a real terminal (`terminal` node, with the host's "Open in bottom panel"), while
 // the plugin still needs the output for the failures list, the flag and "Send failures
-// to Claude", and the exit status. The terminal runs the command under script(1),
-// which records everything the terminal shows into a file in the data dir (flushed on
-// every write) and exits with the command's status:
+// to Claude", and the exit status. The terminal runs
+//
+//	/bin/sh -c 'echo $$ > "$1"; exec "$2" "$3" "$4"' sh <pid> $SHELL -lc <command>
+//
+// and the plugin reads its whole output, the scrollback and the screen
+// (terminal/read with scrollback, capability terminal.scrollback), every readPoll while
+// it runs and once more when terminal/exited brings the exit status. The shell writes
+// its pid, which is the run's process group (the host makes a terminal's process a
+// session leader), so Stop signals the group and the terminal stays with the output up
+// to the stop; without a pid it closes the terminal.
+//
+// An older host answers such a read with the screen only. There the command runs under
+// script(1), which records everything the terminal shows into a file in the data dir
+// (flushed on every write) and exits with the command's status:
 //
 //	/usr/bin/script -q -F <out> /bin/sh -c 'echo $$ > "$1"; exec "$2" "$3" "$4"' sh <pid> $SHELL -lc <command>
 //
-// The plugin tails <out> into the run, and reads the exit status from terminal/list.
-// The inner shell writes its pid, which is the run's process group (script makes it a
-// session leader), so Stop signals the group and the terminal stays with the output up
-// to the stop; without a pid it closes the terminal.
+// and the plugin tails <out> into the run and reads the exit status from terminal/list.
 
 // scriptPath is macOS's script(1).
 const scriptPath = "/usr/bin/script"
@@ -57,11 +65,24 @@ func terminalsUsable(h *pluginsdk.Host) bool {
 	return h.Granted().Terminals && h.HasCapability("terminals") && h.HasCapability("view.node.terminal")
 }
 
-// terminalArgv is the terminal's program: script recording into out, the inner shell
+// pidShell is the shell that writes its pid to $1, then becomes the user's login shell
+// running the command.
+var pidShell = []string{"/bin/sh", "-c", `echo $$ > "$1"; exec "$2" "$3" "$4"`, "sh"}
+
+// runArgv is the terminal's program when the host reads the scrollback: the shell
 // writing its pid to pidFile, then the user's login shell running the command.
-func terminalArgv(out, pidFile, shell, flag, command string) []string {
-	return []string{scriptPath, "-q", "-F", out, "/bin/sh", "-c", `echo $$ > "$1"; exec "$2" "$3" "$4"`, "sh", pidFile, shell, flag, command}
+func runArgv(pidFile, shell, flag, command string) []string {
+	return append(append([]string(nil), pidShell...), pidFile, shell, flag, command)
 }
+
+// terminalArgv is the terminal's program on an older host: script recording into out,
+// then runArgv's shell.
+func terminalArgv(out, pidFile, shell, flag, command string) []string {
+	return append([]string{scriptPath, "-q", "-F", out}, runArgv(pidFile, shell, flag, command)...)
+}
+
+// scrollbackUsable: the host reads a terminal's scrollback, so no script(1).
+func scrollbackUsable(h *pluginsdk.Host) bool { return h.HasCapability("terminal.scrollback") }
 
 // terminalEnv is what a terminal run adds to the environment: no watch modes or
 // prompts (vitest and jest watch on a terminal unless CI is set). Colours stay: it is
@@ -78,6 +99,122 @@ func runFiles(dataDir, dir string) (out, pid string) {
 // execTerminal runs rn in a new plugin terminal and waits for it; it returns the exit
 // status, or an error when the terminal could not start.
 func (r *runner) execTerminal(ctx context.Context, h *pluginsdk.Host, rn *run) (int, error) {
+	if scrollbackUsable(h) {
+		return r.execScrollback(ctx, h, rn)
+	}
+	return r.execScript(ctx, h, rn)
+}
+
+// openTerminal closes the previous run's terminal and makes rn's, running argv.
+func (r *runner) openTerminal(h *pluginsdk.Host, rn *run, argv []string) (string, error) {
+	// The previous run's terminal goes (start waited for that run to end).
+	r.mu.Lock()
+	prev := r.term
+	r.term = ""
+	r.mu.Unlock()
+	if prev != "" {
+		r.closeTerminal(h, prev)
+	}
+	cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	id, err := h.CreateTerminal(cctx, pluginsdk.TerminalCreateParams{
+		Argv:  argv,
+		Cwd:   r.dir,
+		Env:   terminalEnv,
+		Title: truncRunes(rn.Command, 80),
+	})
+	cancel()
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errNoTerminal, err)
+	}
+	r.mu.Lock()
+	r.term, rn.Terminal, rn.TermOpen = id, id, true
+	r.mu.Unlock()
+	r.a.changed(r.dir)
+	r.a.log().Info("test run started", "dir", r.dir, "run", rn.ID, "command", rn.Command, "terminal", id)
+	return id, nil
+}
+
+// terminalGone notes that rn's terminal closed (a stop without a pid, or the user).
+func (r *runner) terminalGone(rn *run, id string) {
+	r.mu.Lock()
+	rn.TermOpen = false
+	if r.term == id {
+		r.term = ""
+	}
+	r.mu.Unlock()
+}
+
+// execScrollback runs rn in a terminal and reads its output with the scrollback: every
+// readPoll while it runs (so failures show as they come) and once more at
+// terminal/exited, which brings the exit status.
+func (r *runner) execScrollback(ctx context.Context, h *pluginsdk.Host, rn *run) (int, error) {
+	_, pidFile := runFiles(h.DataDir(), r.dir)
+	if err := os.MkdirAll(filepath.Dir(pidFile), 0o700); err != nil {
+		return 0, err
+	}
+	_ = os.Remove(pidFile)
+	shell, flag := r.a.cfg.shell()
+	id, err := r.openTerminal(h, rn, runArgv(pidFile, shell, flag, rn.Command))
+	if err != nil {
+		return 0, err
+	}
+	exited := r.a.waitExit(id)
+	defer r.a.doneExit(id)
+
+	var last string
+	read := func() {
+		rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		res, err := h.ReadTerminalWith(rctx, id, pluginsdk.ReadTerminalOptions{Scrollback: true})
+		cancel()
+		if err != nil {
+			if pluginsdk.ErrorCode(err) != pluginsdk.CodeNotFound {
+				r.a.log().Warn("reading the terminal", "terminal", id, "err", err)
+			}
+			return
+		}
+		if res.Text != last || res.Truncated {
+			last = res.Text
+			r.setOutput(rn, res.Text, res.Truncated)
+		}
+	}
+	gone := func() bool {
+		if _, _, ok := terminalState(h, id); ok {
+			return false
+		}
+		r.terminalGone(rn, id)
+		return true
+	}
+	poll := time.NewTicker(r.a.cfg.readPoll)
+	defer poll.Stop()
+	stop := ctx.Done()
+	var kill <-chan time.Time
+	for {
+		select {
+		case <-stop:
+			stop = nil
+			r.signal(h, rn, pidFile, syscall.SIGTERM)
+			kill = time.After(killGrace)
+			if gone() {
+				return -1, nil
+			}
+		case <-kill:
+			kill = nil
+			r.signal(h, rn, pidFile, syscall.SIGKILL)
+		case code := <-exited:
+			read()
+			return code, nil
+		case <-poll.C:
+			read()
+			if gone() {
+				return -1, nil
+			}
+		}
+	}
+}
+
+// execScript runs rn in a terminal under script(1) and tails the file it records (a
+// host without terminal.scrollback).
+func (r *runner) execScript(ctx context.Context, h *pluginsdk.Host, rn *run) (int, error) {
 	out, pidFile := runFiles(h.DataDir(), r.dir)
 	if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
 		return 0, err
@@ -89,32 +226,11 @@ func (r *runner) execTerminal(ctx context.Context, h *pluginsdk.Host, rn *run) (
 	}
 	defer f.Close()
 
-	// The previous run's terminal goes (start waited for that run to end).
-	r.mu.Lock()
-	prev := r.term
-	r.term = ""
-	r.mu.Unlock()
-	if prev != "" {
-		r.closeTerminal(h, prev)
-	}
-
 	shell, flag := r.a.cfg.shell()
-	cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	id, err := h.CreateTerminal(cctx, pluginsdk.TerminalCreateParams{
-		Argv:  terminalArgv(out, pidFile, shell, flag, rn.Command),
-		Cwd:   r.dir,
-		Env:   terminalEnv,
-		Title: truncRunes(rn.Command, 80),
-	})
-	cancel()
+	id, err := r.openTerminal(h, rn, terminalArgv(out, pidFile, shell, flag, rn.Command))
 	if err != nil {
-		return 0, fmt.Errorf("%w: %w", errNoTerminal, err)
+		return 0, err
 	}
-	r.mu.Lock()
-	r.term, rn.Terminal, rn.TermOpen = id, id, true
-	r.mu.Unlock()
-	r.a.changed(r.dir)
-	r.a.log().Info("test run started", "dir", r.dir, "run", rn.ID, "command", rn.Command, "terminal", id)
 
 	tail := &tailer{f: f}
 	tick := time.NewTicker(r.a.cfg.termPoll)
@@ -144,12 +260,7 @@ func (r *runner) execTerminal(ctx context.Context, h *pluginsdk.Host, rn *run) (
 		tail.read(func(line string) { r.output(rn, line) })
 		tail.flush(func(line string) { r.output(rn, line) })
 		if !ok { // closed: by a stop without a pid, or by the user
-			r.mu.Lock()
-			rn.TermOpen = false
-			if r.term == id {
-				r.term = ""
-			}
-			r.mu.Unlock()
+			r.terminalGone(rn, id)
 			return -1, nil
 		}
 		return exit, nil

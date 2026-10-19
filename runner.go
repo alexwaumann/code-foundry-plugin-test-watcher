@@ -69,6 +69,9 @@ type run struct {
 	// Dropped counts lines cut from the head to stay under the caps.
 	Dropped int
 	nextSeq int
+	// Gen counts the times the output was replaced as a whole (a terminal read with
+	// the scrollback), so a view re-sends its log instead of appending.
+	Gen int
 }
 
 // runSnap is a copy of a run for rendering.
@@ -86,6 +89,7 @@ type runSnap struct {
 	Format      format
 	Lines       []outLine
 	Dropped     int
+	Gen         int
 	Terminal    string
 	TermOpen    bool
 }
@@ -96,7 +100,7 @@ func (r *run) snap(withLines bool) *runSnap {
 	}
 	s := &runSnap{ID: r.ID, Command: r.Command, Trigger: r.Trigger, Started: r.Started, Ended: r.Ended,
 		State: r.State, Exit: r.Exit, Problem: r.Problem, Failures: r.parser.Failures(),
-		FailedCount: r.parser.FailedCount(), Format: r.parser.format, Dropped: r.Dropped,
+		FailedCount: r.parser.FailedCount(), Format: r.parser.format, Dropped: r.Dropped, Gen: r.Gen,
 		Terminal: r.Terminal, TermOpen: r.TermOpen}
 	if withLines {
 		s.Lines = append([]outLine(nil), r.lines...)
@@ -361,24 +365,57 @@ func (r *runner) read(src io.Reader, rn *run) {
 	}
 }
 
-// output adds one line of output to the run (parsed for failures) and schedules a
-// render.
-func (r *runner) output(rn *run, line string) {
+// cleanLine is one line of output as the plugin keeps it: no colours, no line end, only
+// what a carriage-return progress line drew last, no control characters.
+func cleanLine(line string) string {
 	text := strings.TrimRight(stripANSI(line), "\r\n")
-	// A carriage-return progress line keeps only what was drawn last.
 	if i := strings.LastIndexByte(text, '\r'); i >= 0 {
 		text = text[i+1:]
 	}
-	text = strings.Map(func(c rune) rune {
+	return strings.Map(func(c rune) rune {
 		if c < ' ' && c != '\t' || c == 0x7f {
 			return -1 // backspaces, bells and other controls a terminal draws
 		}
 		return c
 	}, text)
+}
+
+// output adds one line of output to the run (parsed for failures) and schedules a
+// render.
+func (r *runner) output(rn *run, line string) {
+	text := cleanLine(line)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rn.parser.Line(text)
 	rn.addLine(text, lineTone(text))
+	r.renderSoonLocked()
+}
+
+// setOutput replaces the run's output with text, the whole of it so far (a terminal
+// read with the scrollback, oldest line first; truncated: its head was cut), parsed
+// again from the start, and schedules a render.
+func (r *runner) setOutput(rn *run, text string, truncated bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rn.parser = parser{}
+	rn.lines, rn.bytes, rn.Dropped = nil, 0, 0
+	rn.Gen++
+	rn.addLine("$ "+rn.Command, ui.ToneMuted)
+	if text != "" {
+		for _, l := range strings.Split(text, "\n") {
+			l = cleanLine(l)
+			rn.parser.Line(l)
+			rn.addLine(l, lineTone(l))
+		}
+	}
+	if truncated && rn.Dropped == 0 {
+		rn.Dropped = 1
+	}
+	r.renderSoonLocked()
+}
+
+// renderSoonLocked renders the worktree's views within flushPeriod. r.mu held.
+func (r *runner) renderSoonLocked() {
 	if r.flush == nil {
 		r.flush = time.AfterFunc(flushPeriod, func() {
 			r.mu.Lock()

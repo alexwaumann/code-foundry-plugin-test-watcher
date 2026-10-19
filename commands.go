@@ -54,7 +54,7 @@ func result(msg string, js runJSON) (pluginsdk.CommandResult, error) {
 	return pluginsdk.CommandResult{Message: msg, JSON: data}, nil
 }
 
-func (a *app) cmdRun(_ context.Context, _ *pluginsdk.Host, req pluginsdk.CommandRequest) (pluginsdk.CommandResult, error) {
+func (a *app) cmdRun(_ context.Context, h *pluginsdk.Host, req pluginsdk.CommandRequest) (pluginsdk.CommandResult, error) {
 	t, err := a.threadFor(req)
 	if err != nil {
 		return pluginsdk.CommandResult{}, err
@@ -68,7 +68,7 @@ func (a *app) cmdRun(_ context.Context, _ *pluginsdk.Host, req pluginsdk.Command
 	if err != nil {
 		return pluginsdk.CommandResult{}, err
 	}
-	return result("Running `"+rn.Command+"` in "+t.WorktreePath, runJSON{Thread: t.ID, Dir: t.WorktreePath, Command: rn.Command, Run: rn.ID})
+	return result("Running `"+rn.Command+"` in "+t.WorktreePath+"\nWait for it to finish: "+testsHint(h, t.ID), runJSON{Thread: t.ID, Dir: t.WorktreePath, Command: rn.Command, Run: rn.ID})
 }
 
 func (a *app) cmdStop(_ context.Context, _ *pluginsdk.Host, req pluginsdk.CommandRequest) (pluginsdk.CommandResult, error) {

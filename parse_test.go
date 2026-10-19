@@ -110,9 +110,13 @@ func TestExcerpt(t *testing.T) {
 		{"one enormous line", fails[:1], 1, []string{strings.Repeat("z", 10000)}, []string{fails[0].Title()}, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got := excerpt("go test ./...", tt.fails, tt.count, tt.lines)
+			const hint = "code-foundry thread subscribe --plugin test-watcher/tests-finished --arg thread=s-1"
+			got := excerpt("go test ./...", tt.fails, tt.count, tt.lines, hint)
 			if len(got) > maxExcerpt {
 				t.Errorf("excerpt is %d bytes, cap %d", len(got), maxExcerpt)
+			}
+			if !strings.HasSuffix(got, "\n"+hint) {
+				t.Errorf("excerpt does not end with the wake hint: %q", got[max(0, len(got)-200):])
 			}
 			if !strings.HasPrefix(got, "The tests in this worktree are failing. Please") {
 				t.Errorf("not framed as a request: %.80q", got)

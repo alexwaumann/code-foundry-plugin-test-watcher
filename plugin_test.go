@@ -64,12 +64,14 @@ type fixture struct {
 
 func testConfig() config {
 	return config{
-		debounce: 150 * time.Millisecond,
-		poll:     0,
-		now:      time.Now,
-		shell:    func() (string, string) { return "/bin/sh", "-c" },
-		home:     func() string { return "" },
-		termPoll: 10 * time.Millisecond,
+		debounce:   150 * time.Millisecond,
+		poll:       0,
+		now:        time.Now,
+		shell:      func() (string, string) { return "/bin/sh", "-c" },
+		home:       func() string { return "" },
+		termPoll:   10 * time.Millisecond,
+		readPoll:   10 * time.Millisecond,
+		wakeLinger: 50 * time.Millisecond,
 	}
 }
 
@@ -78,7 +80,8 @@ func start(t *testing.T, dataDir string) *fixture { return startWith(t, dataDir,
 // startWith with terminals grants the terminals permission on a host that renders
 // terminal nodes, and puts the worktree under the "home" folder, so runs go into
 // plugin terminals (plugintest's fakes: nothing runs; the test writes the output).
-func startWith(t *testing.T, dataDir string, terminals bool) *fixture {
+// caps are more host capabilities (terminal.scrollback).
+func startWith(t *testing.T, dataDir string, terminals bool, caps ...string) *fixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
@@ -90,7 +93,7 @@ func startWith(t *testing.T, dataDir string, terminals bool) *fixture {
 		t.Fatal(err)
 	}
 	granted := pluginsdk.Permissions{Commands: []string{"thread.send"}, Events: []string{"project", "threads"}, ThreadStatus: true}
-	caps := []string{"surfaces", "view.tabs"}
+	caps = append([]string{"surfaces", "view.tabs"}, caps...)
 	if terminals {
 		granted.Terminals = true
 		caps = append(caps, "terminals", "view.node.terminal")
@@ -112,6 +115,7 @@ func startWith(t *testing.T, dataDir string, terminals bool) *fixture {
 			return pluginsdk.CommandResult{Message: "sent"}, nil
 		},
 		Capabilities: caps,
+		Wakes:        manifestWakes(t),
 	})
 	t.Cleanup(func() { f.a.shutdown(context.Background(), nil) })
 	f.event(fmt.Sprintf(`{"threadList":{"snapshot":{"threads":[{"id":%q,"projectId":"p1","worktreePath":%q,"name":"fix it"}]}},"epoch":"e"}`, thread, f.dir), true)

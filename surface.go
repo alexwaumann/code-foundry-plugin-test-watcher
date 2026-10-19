@@ -48,6 +48,7 @@ type testsSurface struct {
 	lastJSON []byte
 	logLive  bool
 	logRun   int
+	logGen   int
 	logSeq   int
 }
 
@@ -125,11 +126,16 @@ type model struct {
 	tab                          string
 	formReset                    int
 	cmdErr                       string
+	// hint is the line that subscribes the thread to its next run (tests-finished).
+	hint string
 }
 
 func (s *testsSurface) model() model {
 	dir := s.workdir()
 	m := model{thread: s.thread, dir: dir}
+	if s.thread != "" {
+		m.hint = testsHint(s.h, s.thread)
+	}
 	s.mu.Lock()
 	m.tab, m.formReset, m.cmdErr = s.tab, s.formReset, s.cmdErr
 	s.mu.Unlock()
@@ -159,10 +165,10 @@ func (s *testsSurface) render() error {
 	v := buildView(m)
 	var pending []pluginsdk.AppendLine
 	if log := findLog(v.Nodes); log != nil && m.cur != nil {
-		if !s.logLive || s.logRun != m.cur.ID {
+		if !s.logLive || s.logRun != m.cur.ID || s.logGen != m.cur.Gen {
 			log.Lines, log.Truncated = tailLines(m.cur.Lines, logRenderBytes)
 			log.Truncated = log.Truncated || m.cur.Dropped > 0
-			s.logLive, s.logRun = true, m.cur.ID
+			s.logLive, s.logRun, s.logGen = true, m.cur.ID, m.cur.Gen
 			s.logSeq = lastSeq(m.cur.Lines)
 		} else {
 			log.Truncated = m.cur.Dropped > 0
@@ -471,6 +477,10 @@ func statusNodes(m model) []ui.Node {
 	watch.Description = ui.Plain("Run the tests 2 s after files in this worktree stop changing.")
 	watch.Change = ui.EventAction("toggle-watch", "")
 	nodes = append(nodes, ui.NewForm("watch-form", nil, watch), commandForm(m, false))
+	if m.hint != "" {
+		nodes = append(nodes, ui.Node{Key: "wake-hint", Text: &ui.Text{Size: ui.TextSm, Copyable: true,
+			Content: ui.Spans(ui.T("An agent waits for the next run with ").WithTone(ui.ToneMuted), ui.T(m.hint).AsMono())}})
+	}
 	return nodes
 }
 
@@ -668,7 +678,7 @@ func (a *app) sendFailures(ctx context.Context, h *pluginsdk.Host, t threadInfo,
 			lines = own
 		}
 	}
-	text := excerpt(rn.Command, fails, count, lines)
+	text := excerpt(rn.Command, fails, count, lines, testsHint(h, t.ID))
 	if _, err := h.Invoke(ctx, "thread.send", map[string]string{"text": text}, pluginsdk.UiContext{ThreadID: t.ID}); err != nil {
 		return "", fmt.Errorf("sending to Claude: %w", err)
 	}

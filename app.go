@@ -20,17 +20,24 @@ type config struct {
 	now      func() time.Time
 	shell    func() (string, string) // the shell and its flag that run the command
 	home     func() string           // the home directory (terminal runs need the worktree under it)
-	termPoll time.Duration           // how often a terminal run's output and state are read
+	termPoll time.Duration           // how often a script(1) terminal run's output and state are read
+	readPoll time.Duration           // how often a terminal run's scrollback is read while it runs
+	// wakeLinger is how long a thread followed only for a tests-finished subscription
+	// stays followed after its last one ended (an agent subscribing again soon, a
+	// one-shot after each wake, misses no change).
+	wakeLinger time.Duration
 }
 
 func defaultConfig() config {
 	return config{
-		debounce: 2 * time.Second,
-		poll:     2 * time.Second,
-		now:      time.Now,
-		shell:    loginShell,
-		home:     func() string { home, _ := os.UserHomeDir(); return home },
-		termPoll: 200 * time.Millisecond,
+		debounce:   2 * time.Second,
+		poll:       2 * time.Second,
+		now:        time.Now,
+		shell:      loginShell,
+		home:       func() string { home, _ := os.UserHomeDir(); return home },
+		termPoll:   200 * time.Millisecond,
+		readPoll:   time.Second,
+		wakeLinger: 10 * time.Minute,
 	}
 }
 
@@ -114,7 +121,15 @@ type app struct {
 	worktrees map[string]worktreeInfo
 	runners   map[string]*runner
 	surfaces  map[string]*testsSurface
-	flagged   map[string]bool // threads this plugin's flag is up on, as far as it knows
+	flagged   map[string]bool        // threads this plugin's flag is up on, as far as it knows
+	wakeSubs  map[string]string      // tests-finished subscription → its thread
+	lingers   map[string]*time.Timer // thread → the end of its wake-only follow
+
+	// Terminal exits (terminal/exited) by terminal: a run waiting for one, or an exit
+	// that came before the run started waiting.
+	exitMu  sync.Mutex
+	exits   map[string]chan int
+	exitedE map[string]int
 }
 
 func newApp(cfg config) *app {
@@ -126,14 +141,56 @@ func newApp(cfg config) *app {
 		runners:   map[string]*runner{},
 		surfaces:  map[string]*testsSurface{},
 		flagged:   map[string]bool{},
+		wakeSubs:  map[string]string{},
+		lingers:   map[string]*time.Timer{},
+		exits:     map[string]chan int{},
+		exitedE:   map[string]int{},
 	}
+}
+
+// onTerminalExit hands a terminal's exit status to the run waiting for it.
+func (a *app) onTerminalExit(_ context.Context, _ *pluginsdk.Host, ex pluginsdk.TerminalExited) {
+	a.exitMu.Lock()
+	defer a.exitMu.Unlock()
+	if ch, ok := a.exits[ex.TerminalID]; ok {
+		select {
+		case ch <- ex.ExitCode:
+		default:
+		}
+		return
+	}
+	a.exitedE[ex.TerminalID] = ex.ExitCode
+}
+
+// waitExit is the channel a terminal's exit status comes on (at once when it came
+// already); doneExit forgets the terminal.
+func (a *app) waitExit(id string) chan int {
+	a.exitMu.Lock()
+	defer a.exitMu.Unlock()
+	ch := make(chan int, 1)
+	if code, ok := a.exitedE[id]; ok {
+		ch <- code
+		delete(a.exitedE, id)
+	}
+	a.exits[id] = ch
+	return ch
+}
+
+func (a *app) doneExit(id string) {
+	a.exitMu.Lock()
+	defer a.exitMu.Unlock()
+	delete(a.exits, id)
+	delete(a.exitedE, id)
 }
 
 func (a *app) plugin() pluginsdk.Plugin {
 	return pluginsdk.Plugin{
-		Init:     a.init,
-		OnEvent:  a.onEvent,
-		Shutdown: a.shutdown,
+		Init:               a.init,
+		OnEvent:            a.onEvent,
+		Shutdown:           a.shutdown,
+		OnTerminalExit:     a.onTerminalExit,
+		OnWakeSubscribed:   a.wakeSubscribed,
+		OnWakeUnsubscribed: a.wakeUnsubscribed,
 		Commands: map[string]pluginsdk.CommandFunc{
 			"run":           a.cmdRun,
 			"stop":          a.cmdStop,
@@ -161,6 +218,7 @@ func (a *app) init(ctx context.Context, h *pluginsdk.Host) error {
 	a.mu.Unlock()
 	h.Log().Info("test-watcher is up", "host", h.HostVersion(), "dev", h.Dev(), "followed", len(st.followed()), "terminals", terminalsUsable(h))
 	a.closeStaleTerminals(ctx, h)
+	a.initWakes()
 	// threads: which worktree and project each thread works in, and when one goes away;
 	// project: worktree changes (a file changed, a commit, a branch switch) and removals.
 	if _, err := h.Subscribe(ctx, "threads", "project"); err != nil {
@@ -207,16 +265,21 @@ func (a *app) threadDir(id string) string {
 	return a.threads[id].WorktreePath
 }
 
-// follow makes the plugin watch a thread's worktree from now on (and after restarts).
+// follow makes the plugin watch a thread's worktree from now on (and after restarts),
+// for good: one followed for wake subscriptions only is no longer let go after them.
 func (a *app) follow(t threadInfo) *runner {
 	a.mu.Lock()
 	if _, ok := a.threads[t.ID]; !ok {
 		a.threads[t.ID] = t
 	}
 	st := a.st
+	if l := a.lingers[t.ID]; l != nil {
+		l.Stop()
+		delete(a.lingers, t.ID)
+	}
 	a.mu.Unlock()
-	if st != nil && !contains(st.followed(), t.ID) {
-		if err := st.update(func(s *settings) { s.Threads[t.ID] = true }); err != nil {
+	if st != nil && (!contains(st.followed(), t.ID) || st.wakeOnly(t.ID)) {
+		if err := st.update(func(s *settings) { s.Threads[t.ID] = true; delete(s.WakeOnly, t.ID) }); err != nil {
 			a.log().Warn("saving settings", "err", err)
 		}
 	}
@@ -356,6 +419,9 @@ func (a *app) changed(dir string) {
 // thread with watching off is flagged only by a run it asked for (Run now).
 func (a *app) finished(dir string, rn *runSnap) {
 	h := a.host()
+	if h != nil && rn.State == stateError {
+		a.fireFinished(h, dir, rn)
+	}
 	if h == nil || rn.State != statePassed && rn.State != stateFailed {
 		a.changed(dir)
 		return
@@ -368,6 +434,7 @@ func (a *app) finished(dir string, rn *runSnap) {
 			a.clearFlag(h, id, true)
 		}
 	}
+	a.fireFinished(h, dir, rn)
 	a.changed(dir)
 }
 

@@ -1,8 +1,8 @@
 {
   "name": "test-watcher",
   "displayName": "Test Watcher",
-  "version": "0.1.3",
-  "description": "Runs the project's tests in a thread's worktree whenever files change, shows failures and output in the side panel, flags the thread while tests fail (until they pass or you clear it), and sends failures to Claude.",
+  "version": "0.2.0",
+  "description": "Runs the project's tests in a thread's worktree whenever files change, shows failures and output in the side panel, flags the thread while tests fail (until they pass or you clear it), sends failures to Claude, and wakes agents waiting for a run.",
   "protocol": 1,
   "exec": ["bin/test-watcher"],
   "permissions": {
@@ -57,6 +57,18 @@
       "description": "Turn running the tests on every file change on or off for the thread.",
       "when": "thread && project.git",
       "args": [{ "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }]
+    }
+  ],
+  "wakes": [
+    {
+      "name": "tests-finished",
+      "title": "Test run finished",
+      "description": "A test run in the thread's worktree ended with a result (passed, failed or could not run). Subscribing makes the plugin watch the thread's worktree. The payload has the result, command, exit status, duration and failing tests.",
+      "scope": "thread",
+      "args": [
+        { "name": "thread", "context": "thread", "required": true, "description": "The thread whose test runs to wait for" },
+        { "name": "result", "type": "enum", "enum": ["pass", "fail"], "description": "Only runs with this result (default: every run)" }
+      ]
     }
   ],
   "surfaces": [{ "id": "tests", "title": "Tests", "icon": "flask-conical", "scope": "thread", "when": "project.git" }]
