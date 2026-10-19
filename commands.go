@@ -81,8 +81,46 @@ func (a *app) cmdStop(_ context.Context, _ *pluginsdk.Host, req pluginsdk.Comman
 	msg := "No test run in progress"
 	if stopped {
 		msg = "Stopped the test run"
+		// The tests' state is unknown now: the flag goes until a run fails again.
+		a.clearFlagsOn(t.WorktreePath)
 	}
 	return result(msg, runJSON{Thread: t.ID, Dir: t.WorktreePath, Stopped: &stopped})
+}
+
+// userClearFlag takes the failing-tests flag off a thread for the user. It stays down
+// for the same failing tests; a different set raises it again, a passing run resets.
+func (a *app) userClearFlag(h *pluginsdk.Host, t threadInfo) (bool, error) {
+	was := a.isFlagged(t.ID)
+	if a.st.flagSet(t.ID) == "" {
+		// A flag from before this version, or none: remember the failures shown now.
+		if r := a.existingRunner(t.WorktreePath); r != nil {
+			cur, res, _, _ := r.snapshot(false)
+			if rn := failing(model{cur: cur, result: res}); rn != nil && rn.State == stateFailed {
+				a.saveFlagSet(t.ID, failSet(rn))
+			}
+		}
+	}
+	if err := a.clearFlag(h, t.ID, false); err != nil {
+		return false, err
+	}
+	a.changed(t.WorktreePath)
+	return was, nil
+}
+
+func (a *app) cmdClearFlag(_ context.Context, h *pluginsdk.Host, req pluginsdk.CommandRequest) (pluginsdk.CommandResult, error) {
+	t, err := a.threadFor(req)
+	if err != nil {
+		return pluginsdk.CommandResult{}, err
+	}
+	was, err := a.userClearFlag(h, t)
+	if err != nil {
+		return pluginsdk.CommandResult{}, err
+	}
+	msg := "No flag on this thread"
+	if was {
+		msg = "Cleared the flag; it comes back when other tests fail"
+	}
+	return result(msg, runJSON{Thread: t.ID, Dir: t.WorktreePath})
 }
 
 func (a *app) cmdSendFailures(ctx context.Context, h *pluginsdk.Host, req pluginsdk.CommandRequest) (pluginsdk.CommandResult, error) {
@@ -167,6 +205,11 @@ func (a *app) setWatch(t threadInfo, on bool) error {
 		return err
 	}
 	r := a.follow(t)
+	if !on {
+		if h := a.host(); h != nil {
+			_ = a.clearFlag(h, t.ID, true)
+		}
+	}
 	if !on && !a.watched(t.WorktreePath) {
 		r.mu.Lock()
 		if r.timer != nil {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,24 @@ type threadInfo struct {
 	Name         string `json:"name"`
 	Archived     bool   `json:"archived"`
 	ArchivedAt   string `json:"archivedAt"`
+	// Flags are the plugins' flags on the thread; the plugin reads whether its own is
+	// still up (the user may clear it from the thread header or the CLI).
+	Flags []struct {
+		Plugin string `json:"plugin"`
+	} `json:"flags"`
+}
+
+// pluginName is the plugin's name in plugin.json, the source of its flags.
+const pluginName = "test-watcher"
+
+// hasOwnFlag: the thread carries this plugin's flag.
+func (t threadInfo) hasOwnFlag() bool {
+	for _, f := range t.Flags {
+		if f.Plugin == pluginName {
+			return true
+		}
+	}
+	return false
 }
 
 // worktreeInfo is what the project event source says about a worktree.
@@ -95,7 +114,7 @@ type app struct {
 	worktrees map[string]worktreeInfo
 	runners   map[string]*runner
 	surfaces  map[string]*testsSurface
-	flagged   map[string]bool // threads this plugin has an error flag on
+	flagged   map[string]bool // threads this plugin's flag is up on, as far as it knows
 }
 
 func newApp(cfg config) *app {
@@ -121,6 +140,7 @@ func (a *app) plugin() pluginsdk.Plugin {
 			"set-command":   a.cmdSetCommand,
 			"toggle-watch":  a.cmdToggleWatch,
 			"send-failures": a.cmdSendFailures,
+			"clear-flag":    a.cmdClearFlag,
 		},
 		Surfaces: map[string]pluginsdk.SurfaceFactory{"tests": a.openTests},
 	}
@@ -332,39 +352,95 @@ func (a *app) changed(dir string) {
 }
 
 // finished records a run's result: flags on the followed threads in its worktree, and
-// the views.
+// the views. The flag is sticky: a failing run raises it, a passing run clears it. A
+// thread with watching off is flagged only by a run it asked for (Run now).
 func (a *app) finished(dir string, rn *runSnap) {
-	a.changed(dir)
-	if rn.State != statePassed && rn.State != stateFailed {
+	h := a.host()
+	if h == nil || rn.State != statePassed && rn.State != stateFailed {
+		a.changed(dir)
 		return
 	}
+	for _, id := range a.threadsOn(dir) {
+		switch {
+		case rn.State == stateFailed && (rn.Trigger == "manual" || a.st.watching(id)):
+			a.raiseFlag(h, id, rn)
+		case rn.State == statePassed:
+			a.clearFlag(h, id, true)
+		}
+	}
+	a.changed(dir)
+}
+
+// raiseFlag puts the error flag on a thread for a failing run, unless it was already
+// raised for this set of failing tests: then it is up still, or the user cleared it
+// and it stays down until the set changes.
+func (a *app) raiseFlag(h *pluginsdk.Host, id string, rn *runSnap) {
+	set := failSet(rn)
+	if a.st.flagSet(id) == set {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.SetFlag(ctx, pluginsdk.Flag{ThreadID: id, Level: pluginsdk.FlagError, Reason: flagReason(rn)}); err != nil {
+		h.Log().Warn("flag", "thread", id, "err", err)
+		return
+	}
+	a.setFlagged(id, true)
+	a.saveFlagSet(id, set)
+}
+
+// clearFlag takes the flag off a thread. forget (a passing run, Stop, watching off)
+// also forgets the failing set it was raised for, so the next failure raises it again;
+// the user's Clear flag keeps it, so the same failures do not.
+func (a *app) clearFlag(h *pluginsdk.Host, id string, forget bool) error {
+	a.mu.Lock()
+	up := a.flagged[id]
+	a.mu.Unlock()
+	known := a.st.flagSet(id) != ""
+	if !up && !known && forget {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.SetFlag(ctx, pluginsdk.Flag{ThreadID: id, Level: pluginsdk.FlagNone}); err != nil {
+		h.Log().Warn("flag", "thread", id, "err", err)
+		return err
+	}
+	a.setFlagged(id, false)
+	if forget && known {
+		a.saveFlagSet(id, "")
+	}
+	return nil
+}
+
+// clearFlagsOn clears (and forgets) the flags of the followed threads working in dir.
+func (a *app) clearFlagsOn(dir string) {
 	h := a.host()
 	if h == nil {
 		return
 	}
 	for _, id := range a.threadsOn(dir) {
-		a.mu.Lock()
-		was := a.flagged[id]
-		a.mu.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		var err error
-		switch {
-		case rn.State == stateFailed:
-			err = h.SetFlag(ctx, pluginsdk.Flag{ThreadID: id, Level: pluginsdk.FlagError, Reason: flagReason(rn), UntilSeen: true})
-			if err == nil {
-				a.setFlagged(id, true)
-			}
-		case was:
-			err = h.SetFlag(ctx, pluginsdk.Flag{ThreadID: id, Level: pluginsdk.FlagNone})
-			if err == nil {
-				a.setFlagged(id, false)
-			}
-		}
-		cancel()
-		if err != nil {
-			h.Log().Warn("flag", "thread", id, "err", err)
-		}
+		_ = a.clearFlag(h, id, true)
 	}
+	a.changed(dir)
+}
+
+func (a *app) saveFlagSet(id, set string) {
+	if err := a.st.update(func(s *settings) {
+		if set == "" {
+			delete(s.FlagSets, id)
+		} else {
+			s.FlagSets[id] = set
+		}
+	}); err != nil {
+		a.log().Warn("saving settings", "err", err)
+	}
+}
+
+func (a *app) isFlagged(id string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.flagged[id]
 }
 
 func (a *app) setFlagged(id string, on bool) {
@@ -375,6 +451,23 @@ func (a *app) setFlagged(id string, on bool) {
 	} else {
 		delete(a.flagged, id)
 	}
+}
+
+// failSet identifies a failing run's failures: the failing tests with their packages
+// or files, sorted; a run whose output names none, by its count or exit status.
+func failSet(rn *runSnap) string {
+	if len(rn.Failures) == 0 {
+		if rn.FailedCount > 0 {
+			return itoa(rn.FailedCount) + " failed"
+		}
+		return "exit " + itoa(rn.Exit)
+	}
+	names := make([]string, len(rn.Failures))
+	for i, f := range rn.Failures {
+		names[i] = f.Where + "\t" + f.Name
+	}
+	sort.Strings(names)
+	return strings.Join(names, "\n")
 }
 
 // flagReason is the flag's one line: "Tests failing: TestAdd (example.com/calc)", or a

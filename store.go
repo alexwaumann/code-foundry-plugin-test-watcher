@@ -21,6 +21,10 @@ type settings struct {
 	// Threads are the threads the plugin follows: the ones whose Tests tab was opened or
 	// that ran a command. They are watched again after a restart.
 	Threads map[string]bool `json:"threads,omitempty"`
+	// FlagSets are the failing tests each thread's flag was raised for (failSet). They
+	// stay after the user clears the flag, so the same failures do not raise it again;
+	// a passing run, Stop or watching off forgets them.
+	FlagSets map[string]string `json:"flagSets,omitempty"`
 }
 
 // store guards settings and writes them through to dir/settings.json.
@@ -57,6 +61,12 @@ func (st *store) watching(thread string) bool {
 	return !st.s.Unwatched[thread]
 }
 
+func (st *store) flagSet(thread string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.s.FlagSets[thread]
+}
+
 func (st *store) followed() []string {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -79,6 +89,9 @@ func (st *store) update(f func(s *settings)) error {
 	}
 	if st.s.Threads == nil {
 		st.s.Threads = map[string]bool{}
+	}
+	if st.s.FlagSets == nil {
+		st.s.FlagSets = map[string]string{}
 	}
 	f(&st.s)
 	data, err := json.MarshalIndent(st.s, "", "  ")

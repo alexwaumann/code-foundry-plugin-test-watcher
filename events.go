@@ -57,6 +57,7 @@ func (a *app) onThreads(e event) {
 			if !t.Archived && t.ArchivedAt == "" {
 				a.threads[t.ID] = t
 			}
+			a.syncFlagLocked(t)
 		}
 		for id := range old {
 			if _, ok := a.threads[id]; !ok {
@@ -71,8 +72,10 @@ func (a *app) onThreads(e event) {
 		} else {
 			a.threads[t.ID] = t
 		}
+		a.syncFlagLocked(t)
 	case tl.RemovedID != "":
 		delete(a.threads, tl.RemovedID)
+		delete(a.flagged, tl.RemovedID)
 		removed = append(removed, tl.RemovedID)
 	}
 	st := a.st
@@ -105,6 +108,7 @@ func (a *app) onThreads(e event) {
 				for _, id := range gone {
 					delete(s.Threads, id)
 					delete(s.Unwatched, id)
+					delete(s.FlagSets, id)
 				}
 			}); err != nil {
 				a.log().Warn("saving settings", "err", err)
@@ -171,6 +175,17 @@ func (a *app) onProject(e event) {
 		if _, err := os.Stat(dir); err != nil {
 			a.worktreeGone(dir)
 		}
+	}
+}
+
+// syncFlagLocked follows the thread's own flag as the host reports it: the user may
+// clear it (the thread header's ×, `code-foundry thread flag clear`), and archiving
+// clears it. Events arrive in order, so the last one is the host's state. a.mu held.
+func (a *app) syncFlagLocked(t threadInfo) {
+	if t.hasOwnFlag() {
+		a.flagged[t.ID] = true
+	} else {
+		delete(a.flagged, t.ID)
 	}
 }
 

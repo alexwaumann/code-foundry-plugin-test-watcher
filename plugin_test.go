@@ -194,6 +194,34 @@ func (f *fixture) waitPill(label string) ui.View {
 	return f.view()
 }
 
+// barKeys are the keys of the actions bar's buttons in the instance's last view.
+func (f *fixture) barKeys() []string {
+	raw, ok := f.h.View(inst)
+	if !ok {
+		return nil
+	}
+	var v ui.View
+	if json.Unmarshal(raw, &v) != nil {
+		return nil
+	}
+	n := node(v, "bar")
+	if n == nil || n.Actions == nil {
+		return nil
+	}
+	var keys []string
+	for _, b := range n.Actions.Buttons {
+		keys = append(keys, b.Key)
+	}
+	return keys
+}
+
+// waitBar waits for the actions bar to hold exactly these buttons.
+func (f *fixture) waitBar(keys ...string) ui.View {
+	f.t.Helper()
+	f.h.WaitFor(10*time.Second, func(*plugintest.Host) bool { return strings.Join(f.barKeys(), ",") == strings.Join(keys, ",") })
+	return f.view()
+}
+
 func (f *fixture) command(name string, args map[string]string) pluginsdk.CommandResult {
 	f.t.Helper()
 	if args == nil {
@@ -319,34 +347,79 @@ func TestToggleWatch(t *testing.T) {
 	f.eventually("a change runs again", func() bool { return strings.Count(f.read("log"), "ran") == 2 })
 }
 
-// A failing run flags the thread with its first failing test; a passing run clears it.
+// lastFlag is the plugin's last SetFlag call, and how many it made.
+func (f *fixture) lastFlag() (pluginsdk.Flag, int) {
+	fs := f.h.Flags()
+	if len(fs) == 0 {
+		return pluginsdk.Flag{}, 0
+	}
+	return fs[len(fs)-1], len(fs)
+}
+
+// waitFlags waits for the plugin's n-th SetFlag call and returns it.
+func (f *fixture) waitFlags(n int) pluginsdk.Flag {
+	f.t.Helper()
+	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool { return len(h.Flags()) >= n })
+	fl, got := f.lastFlag()
+	if got != n {
+		f.t.Fatalf("%d flag calls, want %d: %+v", got, n, f.h.Flags())
+	}
+	return fl
+}
+
+// noMoreFlags checks the plugin made no SetFlag call beyond n.
+func (f *fixture) noMoreFlags(n int) {
+	f.t.Helper()
+	time.Sleep(300 * time.Millisecond)
+	if _, got := f.lastFlag(); got != n {
+		f.t.Fatalf("%d flag calls, want %d: %+v", got, n, f.h.Flags())
+	}
+}
+
+// failOnly is a go test run in which the named tests fail.
+func failOnly(names ...string) string {
+	var b strings.Builder
+	for _, n := range names {
+		b.WriteString(`--- FAIL: ` + n + ` (0.00s)\n`)
+	}
+	return `printf -- '` + b.String() + `FAIL\nFAIL\texample.com/calc\t0.01s\nFAIL\n'; exit 1`
+}
+
+// The flag is sticky: a failing run raises it (not until seen), the same failures do
+// not raise it again, other failures replace it, a passing run clears it.
 func TestFlagLifecycle(t *testing.T) {
 	f := start(t, "")
 	f.open()
 	f.command("set-command", map[string]string{"command": goFailing})
 	f.command("run", nil)
 	f.waitPill("failing")
-	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool { return len(h.Flags()) == 1 })
-	fl := f.h.Flags()[0]
-	if fl.ThreadID != thread || fl.Level != pluginsdk.FlagError || fl.Reason != "Tests failing: TestAdd" || !fl.UntilSeen {
+	fl := f.waitFlags(1)
+	if fl.ThreadID != thread || fl.Level != pluginsdk.FlagError || fl.Reason != "Tests failing: TestAdd" || fl.UntilSeen {
 		t.Errorf("flag = %+v", fl)
 	}
-	// Failing again replaces it; nothing clears in between.
+	// The same failures again: the flag is up already, nothing is sent.
 	f.command("run", nil)
-	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool { return len(h.Flags()) == 2 })
+	f.noMoreFlags(1)
+	// Other failures replace it.
+	f.command("set-command", map[string]string{"command": failOnly("TestAdd", "TestMul")})
+	f.command("run", nil)
+	if fl := f.waitFlags(2); fl.Reason != "Tests failing: TestAdd and 1 more" {
+		t.Errorf("flag = %+v", fl)
+	}
 	f.command("set-command", map[string]string{"command": "true"})
 	f.command("run", nil)
 	f.waitPill("passing")
-	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool { return len(h.Flags()) == 3 })
-	if fl := f.h.Flags()[2]; fl.Level != pluginsdk.FlagNone {
+	if fl := f.waitFlags(3); fl.Level != pluginsdk.FlagNone {
 		t.Errorf("passing run: %+v, want a clear", fl)
 	}
 	// Passing again: nothing to clear.
 	f.command("run", nil)
-	time.Sleep(300 * time.Millisecond)
-	f.waitPill("passing")
-	if n := len(f.h.Flags()); n != 3 {
-		t.Errorf("%d flag calls, want 3", n)
+	f.noMoreFlags(3)
+	// Failing after a pass raises it again, even for failures flagged before.
+	f.command("set-command", map[string]string{"command": goFailing})
+	f.command("run", nil)
+	if fl := f.waitFlags(4); fl.Level != pluginsdk.FlagError {
+		t.Errorf("failing after a pass: %+v", fl)
 	}
 	for _, tt := range []struct {
 		rn   runSnap
@@ -370,7 +443,8 @@ func TestFailingAndPassingViews(t *testing.T) {
 	f.open()
 	f.command("set-command", map[string]string{"command": goFailing})
 	f.command("run", nil)
-	v := f.waitPill("failing")
+	f.waitPill("failing")
+	v := f.waitBar("run-now", "clear-flag", "send-failures")
 	if v.Header.Title != "scratch" || v.Header.Trailing == nil || v.Header.Trailing.Spans[0].Text != "main" {
 		t.Errorf("header = %+v", v.Header)
 	}
@@ -378,9 +452,11 @@ func TestFailingAndPassingViews(t *testing.T) {
 		t.Errorf("header actions = %+v", v.Header.Actions)
 	}
 	bar := node(v, "bar").Actions.Buttons
-	if len(bar) != 2 || bar[1].Key != "send-failures" || bar[1].Style != ui.ButtonAttention ||
-		bar[1].Action.Command == nil || bar[1].Action.Command.Name != "plugin.test-watcher.send-failures" {
+	if bar[2].Style != ui.ButtonAttention || bar[2].Action.Command == nil || bar[2].Action.Command.Name != "plugin.test-watcher.send-failures" {
 		t.Errorf("actions bar = %+v", bar)
+	}
+	if bar[1].Action.Event != "clear-flag" || bar[1].Style != "" {
+		t.Errorf("clear flag button = %+v", bar[1])
 	}
 	for _, b := range append(bar, v.Header.Actions...) {
 		if b.Action.Command != nil && len(b.Action.Command.Args) > 0 {
@@ -434,10 +510,8 @@ func TestFailingAndPassingViews(t *testing.T) {
 
 	f.command("set-command", map[string]string{"command": "echo ok"})
 	f.command("run", nil)
-	v = f.waitPill("passing")
-	if len(node(v, "bar").Actions.Buttons) != 1 {
-		t.Errorf("passing actions bar = %+v", node(v, "bar").Actions.Buttons)
-	}
+	f.waitPill("passing")
+	f.waitBar("run-now")
 	v = f.tab(tabFailures)
 	if n := node(v, "passing"); n == nil || n.Empty.Title != "All tests pass" {
 		t.Errorf("passing failures tab = %+v", v.Nodes)
@@ -743,5 +817,161 @@ func TestTerminalNeedsCapability(t *testing.T) {
 	}
 	if len(f.h.CreatedTerminals()) != 0 {
 		t.Error("made a terminal")
+	}
+}
+
+// The user's Clear flag (command or the view's button) takes the flag down; the same
+// failures do not raise it again, a different set does; after a pass the old set
+// raises it again too.
+func TestClearFlag(t *testing.T) {
+	for _, how := range []string{"command", "button"} {
+		t.Run(how, func(t *testing.T) {
+			f := start(t, "")
+			f.open()
+			if res := f.command("clear-flag", nil); res.Message != "No flag on this thread" {
+				t.Errorf("clear-flag without a flag: %q", res.Message)
+			}
+			n := len(f.h.Flags())
+			f.command("set-command", map[string]string{"command": failOnly("TestAdd")})
+			f.command("run", nil)
+			f.waitFlags(n + 1)
+			f.waitBar("run-now", "clear-flag", "send-failures")
+			switch how {
+			case "command":
+				if res := f.command("clear-flag", nil); res.Message != "Cleared the flag; it comes back when other tests fail" {
+					t.Errorf("clear-flag: %q", res.Message)
+				}
+			case "button":
+				f.act(pluginsdk.SurfaceAct{Kind: pluginsdk.ActClick, Action: "clear-flag", Key: "clear-flag"})
+			}
+			if fl := f.waitFlags(n + 2); fl.Level != pluginsdk.FlagNone {
+				t.Fatalf("clear: %+v", fl)
+			}
+			f.waitBar("run-now", "send-failures")
+			// The same failing test again (a file changed, or Run now): no flag.
+			f.command("run", nil)
+			f.waitPill("failing")
+			f.change()
+			time.Sleep(400 * time.Millisecond)
+			f.waitPill("failing")
+			f.noMoreFlags(n + 2)
+			// A different set of failures raises it.
+			f.command("set-command", map[string]string{"command": failOnly("TestMul")})
+			f.command("run", nil)
+			if fl := f.waitFlags(n + 3); fl.Level != pluginsdk.FlagError || fl.Reason != "Tests failing: TestMul" {
+				t.Errorf("new failures: %+v", fl)
+			}
+			// Cleared again, then a pass, then the same failures: raised (the condition
+			// ended and came back).
+			f.command("clear-flag", nil)
+			f.waitFlags(n + 4)
+			f.command("set-command", map[string]string{"command": "true"})
+			f.command("run", nil)
+			f.waitPill("passing")
+			// Already down; the pass still sends a clear (a no-op for the host) as it
+			// forgets the failures, in case the flag is up after all.
+			if fl := f.waitFlags(n + 5); fl.Level != pluginsdk.FlagNone {
+				t.Errorf("pass after a clear: %+v", fl)
+			}
+			f.command("set-command", map[string]string{"command": failOnly("TestMul")})
+			f.command("run", nil)
+			if fl := f.waitFlags(n + 6); fl.Level != pluginsdk.FlagError {
+				t.Errorf("after a pass: %+v", fl)
+			}
+		})
+	}
+}
+
+// A clear from outside the plugin (the thread header's ×, thread flag clear) arrives
+// as a thread update without the flag: the button goes, and the same failures do not
+// raise it again.
+func TestFlagClearedByUser(t *testing.T) {
+	f := start(t, "")
+	f.open()
+	f.command("set-command", map[string]string{"command": failOnly("TestAdd")})
+	f.command("run", nil)
+	f.waitFlags(1)
+	f.event(fmt.Sprintf(`{"threadList":{"updated":{"id":%q,"projectId":"p1","worktreePath":%q,"name":"fix it","flags":[{"plugin":"test-watcher","level":"THREAD_FLAG_LEVEL_ERROR","reason":"Tests failing: TestAdd"}]}},"epoch":"e"}`, thread, f.dir), false)
+	f.waitBar("run-now", "clear-flag", "send-failures")
+	f.event(fmt.Sprintf(`{"threadList":{"updated":{"id":%q,"projectId":"p1","worktreePath":%q,"name":"fix it"}},"epoch":"e"}`, thread, f.dir), false)
+	f.waitBar("run-now", "send-failures")
+	f.command("run", nil)
+	f.noMoreFlags(1)
+}
+
+// Stop and switching watching off clear the flag and forget the failures, so the next
+// failing run raises it again.
+func TestFlagClearedByStopAndWatchOff(t *testing.T) {
+	f := start(t, "")
+	f.open()
+	f.command("set-command", map[string]string{"command": failOnly("TestAdd")})
+	f.command("run", nil)
+	f.waitFlags(1)
+	f.command("set-command", map[string]string{"command": "sleep 30"})
+	f.command("run", nil)
+	f.waitPill("running")
+	f.command("stop", nil)
+	if fl := f.waitFlags(2); fl.Level != pluginsdk.FlagNone {
+		t.Fatalf("stop: %+v", fl)
+	}
+	f.waitPill("stopped")
+	f.command("set-command", map[string]string{"command": failOnly("TestAdd")})
+	f.command("run", nil)
+	if fl := f.waitFlags(3); fl.Level != pluginsdk.FlagError {
+		t.Fatalf("failing after stop: %+v", fl)
+	}
+	if res := f.command("toggle-watch", nil); res.Message != "Watching for changes: off" {
+		t.Fatalf("toggle-watch: %q", res.Message)
+	}
+	if fl := f.waitFlags(4); fl.Level != pluginsdk.FlagNone {
+		t.Fatalf("watching off: %+v", fl)
+	}
+	// With watching off, Run now still flags (the user asked for the run).
+	f.command("run", nil)
+	if fl := f.waitFlags(5); fl.Level != pluginsdk.FlagError {
+		t.Fatalf("run now with watching off: %+v", fl)
+	}
+}
+
+// The failing set a flag was raised for survives a restart: a flag the user cleared
+// before it stays down for the same failures; the live flag from initialize shows the
+// Clear flag button.
+func TestFlagSetSurvivesRestart(t *testing.T) {
+	data := t.TempDir()
+	f := start(t, data)
+	f.open()
+	f.command("set-command", map[string]string{"command": failOnly("TestAdd")})
+	f.command("run", nil)
+	f.waitFlags(1)
+	f.command("clear-flag", nil)
+	f.waitFlags(2)
+	f.h.Close()
+	f.a.shutdown(context.Background(), nil)
+
+	g := start(t, data)
+	g.open()
+	g.command("set-command", map[string]string{"command": failOnly("TestAdd")})
+	g.command("run", nil)
+	g.waitPill("failing")
+	g.noMoreFlags(0)
+}
+
+func TestFailSet(t *testing.T) {
+	a := &runSnap{Failures: []failure{{Name: "B", Where: "p"}, {Name: "A", Where: "p"}}}
+	b := &runSnap{Failures: []failure{{Name: "A", Where: "p"}, {Name: "B", Where: "p"}}}
+	for _, tt := range []struct {
+		x, y *runSnap
+		same bool
+	}{
+		{a, b, true},
+		{a, &runSnap{Failures: []failure{{Name: "A", Where: "p"}}}, false},
+		{&runSnap{Failures: []failure{{Name: "A", Where: "p"}}}, &runSnap{Failures: []failure{{Name: "A", Where: "q"}}}, false},
+		{&runSnap{FailedCount: 2}, &runSnap{FailedCount: 2}, true},
+		{&runSnap{FailedCount: 2}, &runSnap{FailedCount: 3}, false},
+		{&runSnap{Exit: 1}, &runSnap{Exit: 2}, false},
+	} {
+		if got := failSet(tt.x) == failSet(tt.y); got != tt.same {
+			t.Errorf("failSet(%+v) == failSet(%+v): %v, want %v", tt.x, tt.y, got, tt.same)
+		}
 	}
 }

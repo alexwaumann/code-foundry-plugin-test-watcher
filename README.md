@@ -17,12 +17,24 @@ a **Tests** tab of the thread's side panel:
   Foundry without plugin terminals (or when the worktree is outside your home folder):
   the output streamed live into a log, failures in red and warnings in amber (the last
   2,000 lines / 256 KB; the head is cut first).
-- Actions: **Run now**, **Stop** while a run is going, **Send failures to Claude**: a
-  message of at most 4 KB (the command, the failing tests, the last 60 output lines)
-  asking Claude in that thread to fix them.
+- Actions: **Run now**, **Clear flag** while the thread is flagged, **Stop** while a run
+  is going, **Send failures to Claude**: a message of at most 4 KB (the command, the
+  failing tests, the last 60 output lines) asking Claude in that thread to fix them.
 
 While the tests fail the thread is flagged red in the sidebar ("Test Watcher: Tests
-failing: TestAdd"); opening the thread or the next passing run clears it.
+failing: TestAdd"). The flag stays when you open the thread: it says the tests are still
+failing, not that something happened once. It goes when:
+
+- a run passes;
+- you Stop a run, or switch watching off for the thread;
+- you clear it: **Clear flag** in the Tests tab, the `clear-flag` command (also in the
+  palette), the × on the flag in the thread header, or `code-foundry thread flag clear
+  <thread> --plugin test-watcher`.
+
+A flag you cleared stays down while the same tests fail; it comes back when the set of
+failing tests changes (another test fails, or one of them passes while others still
+fail), and after a passing run any failure raises it again. With watching off, only
+Run now flags the thread.
 
 How it runs: 2 s after files stop changing (debounced), one run per worktree at a time;
 a newer change stops the run in progress (its whole process group) and starts again. The
@@ -46,7 +58,7 @@ restarts) until it is archived or removed, or you switch watching off for it.
 
 ```
 code-foundry plugin install test-watcher --enable
-code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.1.2 --enable   # a release directly
+code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.1.3 --enable   # a release directly
 ```
 
 ## Permissions and why
@@ -55,11 +67,12 @@ code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.1.2 
 |---|---|
 | `commands: thread.send` | *Send to Claude* and *Send failures to Claude* post the failure excerpt into the thread. Nothing else is invoked. |
 | `events: project, threads` | `project`: worktree changes (status counts, commits, branch switches) and removed worktrees. `threads`: which worktree and project each thread works in, and when a thread is archived or removed. |
-| `threadStatus` | The red "Tests failing" flag on the thread while its tests fail. |
+| `threadStatus` | The red "Tests failing" flag on the thread while its tests fail (until they pass or you clear it). |
 | `terminals` | The Output tab's terminal: each run is a terminal the plugin owns, in the thread's worktree. Disabling the plugin closes them. |
 
 No secrets, no session environment, no API access. The plugin keeps its settings (test
-commands per project, watched threads, threads with watching off) in
+commands per project, watched threads, threads with watching off, the failing tests each
+flag was raised for) in
 `~/.code-foundry/plugin-data/test-watcher/settings.json`, and the latest terminal run's
 recorded output per worktree in `runs/` beside it.
 
@@ -73,6 +86,7 @@ code-foundry plugin test-watcher run              # run now (replaces a run in p
 code-foundry plugin test-watcher stop             # stop the run in progress
 code-foundry plugin test-watcher set-command "go test -count=1 ./..."   # "" = back to the guess
 code-foundry plugin test-watcher send-failures    # the failing tests to Claude in the thread
+code-foundry plugin test-watcher clear-flag       # take the failing-tests flag off the thread
 code-foundry plugin test-watcher toggle-watch     # watching on/off for the thread
 code-foundry plugin test-watcher show tests       # open the Tests tab in the app
 ```
@@ -96,7 +110,8 @@ The tests cover the debounce and newest-wins (process groups included), the `go 
 vitest and jest parsers on captured output (`testdata/`), the views for failing and
 passing runs, output streaming and caps, terminal runs against plugintest's fake
 terminals (the argv, the recorded output, the exit status, replacing and stopping), the
-flag lifecycle, the 4 KB excerpt, the command form and the edge states (no command,
+flag lifecycle (sticky; cleared by a pass, Stop, watching off or the user; not raised again
+for the same failures, across restarts too), the 4 KB excerpt, the command form and the edge states (no command,
 command not found, worktree deleted).
 
 Worktree events only fire when a worktree's status counts change, so an edit to a file
@@ -105,6 +120,40 @@ worktree every 2 s (`git status` plus size and mtime of each changed file) to ca
 
 The Output tab is one node (`outputNode` in `surface.go`): a `terminal` node while the
 run's terminal is open, else the log node.
+
+### A real run, 0.1.3 (Code Foundry dev build 19052860, isolated home, a scratch Go module)
+
+`cf` runs that build with `CODE_FOUNDRY_HOME` set to the isolated home; edits to
+`calc_test.go` are picked up by the watcher 2 s later.
+
+```
+$ cf plugin dev "$PWD" --follow=false --yes
+enabled test-watcher 0.1.3 (starting)
+$ # TestAdd now wants 6
+$ cf thread flags s-c05266bdd960
+test-watcher  error  Tests failing: TestAdd  2026-10-18 19:34:42  no      # UNTIL SEEN: no
+$ cf plugin act test-watcher tests tab --key tab-failures --thread s-c05266bdd960
+$ cf thread flags s-c05266bdd960
+test-watcher  error  Tests failing: TestAdd  2026-10-18 19:34:42  no
+$ cf plugin restart test-watcher
+$ cf thread flags s-c05266bdd960
+test-watcher  error  Tests failing: TestAdd  2026-10-18 19:34:42  no
+$ cf plugin surface test-watcher tests --thread s-c05266bdd960   # elements
+  clear-flag     click    clear-flag     Clear flag
+$ cf plugin test-watcher clear-flag --thread s-c05266bdd960
+Cleared the flag; it comes back when other tests fail
+$ # TestAdd now wants 7: the run fails on the same test
+test run ended exit=1 run=4
+$ cf thread flags s-c05266bdd960
+thread tw 0.1.3 check (s-c05266bdd960) has no flags
+$ # TestMul now wants 7 as well: a different set
+$ cf thread flags s-c05266bdd960
+test-watcher  error  Tests failing: TestAdd and 1 more  2026-10-18 19:35:48  no
+$ cf thread flag clear s-c05266bdd960 --plugin test-watcher   # the header chip's ×
+$ # TestMul now wants 8: same set, no flag; the Clear flag button is gone
+$ cf thread flags s-c05266bdd960
+thread tw 0.1.3 check (s-c05266bdd960) has no flags
+```
 
 ### A real run, 0.1.1 (Code Foundry dev build 73685d8b, isolated home, a scratch Go module)
 
@@ -153,6 +202,18 @@ thread test watcher run (s-f9b8cf835989) has no flags
 ```
 
 ## Changelog
+
+### 0.1.3
+
+- **The failing-tests flag is sticky**: opening the thread no longer clears it. It goes
+  when a run passes, when you Stop a run or switch watching off, or when you clear it.
+- **Clear flag**: a button in the Tests tab while the thread is flagged, and the
+  `clear-flag` command (palette and CLI). The thread header's × and `code-foundry thread
+  flag clear` work too. A cleared flag is not raised again for the same failing tests,
+  also across restarts; a different set raises it.
+- With watching off for a thread, only Run now flags it (not runs another thread's
+  watching starts in the same worktree).
+- Same permissions as 0.1.2, so updating keeps it enabled.
 
 ### 0.1.2
 

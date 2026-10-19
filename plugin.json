@@ -1,8 +1,8 @@
 {
   "name": "test-watcher",
   "displayName": "Test Watcher",
-  "version": "0.1.2",
-  "description": "Runs the project's tests in a thread's worktree whenever files change, shows failures and output in the side panel, flags the thread while tests fail, and sends failures to Claude.",
+  "version": "0.1.3",
+  "description": "Runs the project's tests in a thread's worktree whenever files change, shows failures and output in the side panel, flags the thread while tests fail (until they pass or you clear it), and sends failures to Claude.",
   "protocol": 1,
   "exec": ["bin/test-watcher"],
   "permissions": {
@@ -41,6 +41,13 @@
       "name": "send-failures",
       "title": "Send Test Failures to Claude",
       "description": "Send the failing tests of the thread's worktree (the latest failing run: the tests, the command and the last output lines) to Claude in the thread.",
+      "when": "thread && project.git",
+      "args": [{ "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }]
+    },
+    {
+      "name": "clear-flag",
+      "title": "Clear Test Failure Flag",
+      "description": "Take the failing-tests flag off the thread. It stays off for the same failing tests; a different set of failures raises it again, and a passing run resets that.",
       "when": "thread && project.git",
       "args": [{ "name": "thread", "context": "thread", "description": "The thread (default: the active one)" }]
     },

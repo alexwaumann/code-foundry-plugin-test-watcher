@@ -118,6 +118,7 @@ type model struct {
 	thread, dir, project, branch string
 	command, source              string
 	watch                        bool
+	flagged                      bool
 	cur, result                  *runSnap
 	changed                      int
 	gone                         bool
@@ -139,6 +140,7 @@ func (s *testsSurface) model() model {
 	m.branch = s.a.branchOf(dir)
 	m.command, m.source = s.a.commandAndSource(dir)
 	m.watch = s.a.st.watching(s.thread)
+	m.flagged = s.a.isFlagged(s.thread)
 	if r := s.a.existingRunner(dir); r != nil {
 		m.cur, m.result, m.changed, m.gone = r.snapshot(m.tab == tabOutput)
 	}
@@ -366,6 +368,11 @@ func actionsBar(m model) ui.Node {
 	running := m.cur != nil && m.cur.State == stateRunning
 	// Command buttons: the host fills each command's thread arg from the panel.
 	buttons := []ui.Button{ui.CommandButton("run-now", "Run now", "plugin.test-watcher.run", nil).WithIcon("play")}
+	if m.flagged {
+		// The flag stays until the tests pass; this is the user's way to drop it sooner
+		// (the thread header's × does the same).
+		buttons = append(buttons, ui.EventButton("clear-flag", "Clear flag", "clear-flag").WithIcon("x"))
+	}
 	if running {
 		buttons = append(buttons, ui.CommandButton("stop", "Stop", "plugin.test-watcher.stop", nil).
 			WithIcon("square").WithStyle(ui.ButtonDestructive))
@@ -591,6 +598,10 @@ func (s *testsSurface) Act(ctx context.Context, act pluginsdk.SurfaceAct) error 
 			s.formReset++
 		}
 		s.mu.Unlock()
+	case "clear-flag":
+		if _, err := s.a.userClearFlag(s.h, t); err != nil {
+			return err
+		}
 	case "send-failures": // an older view's button; the view now runs the command
 		if _, err := s.a.sendFailures(ctx, s.h, t, -1, -1); err != nil {
 			return err
