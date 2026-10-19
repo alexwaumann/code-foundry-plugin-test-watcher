@@ -26,7 +26,22 @@ type event struct {
 		ProjectRemovedID string          `json:"projectRemovedId"`
 		WorktreeUpdated  *worktreeInfo   `json:"worktreeUpdated"`
 		WorktreeRemoved  json.RawMessage `json:"worktreeRemoved"`
+		FilesChanged     *filesChanged   `json:"worktreeFilesChanged"`
 	} `json:"project"`
+}
+
+// filesChanged is project.worktreeFilesChanged: the files that changed in a worktree
+// over the daemon's 1 s window. Gitignored paths are left out, and only worktrees with
+// a live thread send it. A directory ends in "/" (only when removed or renamed);
+// truncated: more files changed than listed.
+type filesChanged struct {
+	ProjectID string `json:"projectId"`
+	Path      string `json:"path"`
+	Files     []struct {
+		Path string `json:"path"`
+		Op   string `json:"op"` // FILE_OP_CREATED, _MODIFIED, _REMOVED, _RENAMED
+	} `json:"files"`
+	Truncated bool `json:"truncated"`
 }
 
 // onEvent updates what the plugin knows and pokes the runners. It runs on the
@@ -78,6 +93,10 @@ func (a *app) onThreads(e event) {
 		delete(a.flagged, tl.RemovedID)
 		removed = append(removed, tl.RemovedID)
 	}
+	runnerDirs := make([]string, 0, len(a.runners))
+	for dir := range a.runners {
+		runnerDirs = append(runnerDirs, dir)
+	}
 	st := a.st
 	followed := []string{}
 	if st != nil {
@@ -95,6 +114,11 @@ func (a *app) onThreads(e event) {
 	for _, d := range dirs {
 		a.runnerFor(d)
 		a.changed(d)
+	}
+	// A worktree no followed thread works in any more (archived, removed, moved) lets
+	// its runner go.
+	for _, d := range runnerDirs {
+		a.forgotten(d)
 	}
 	var gone []string
 	for _, id := range removed {
@@ -124,6 +148,14 @@ func (a *app) onProject(e event) {
 	a.mu.Lock()
 	switch {
 	case p.Snapshot != nil:
+		// A resync: files events may have been lost, so each followed worktree runs
+		// once (trigger skips the ones with watching off).
+		if a.projectSynced {
+			for dir := range a.runners {
+				trigger = append(trigger, dir)
+			}
+		}
+		a.projectSynced = true
 		a.projects = map[string]projectInfo{}
 		old := a.worktrees
 		a.worktrees = map[string]worktreeInfo{}
@@ -147,10 +179,23 @@ func (a *app) onProject(e event) {
 		w := *p.WorktreeUpdated
 		old, had := a.worktrees[w.Path]
 		a.worktrees[w.Path] = w
-		// The status counts, the head or the branch moved: files changed.
+		// The status counts, the head or the branch moved: files changed (a commit or a
+		// checkout; an edit's files event comes too, and the debounce makes it one run).
 		if had && (old.Head != w.Head || old.Branch != w.Branch || !sameStatus(old.Status, w.Status)) {
 			trigger = append(trigger, w.Path)
 		}
+	case p.FilesChanged != nil:
+		fc := p.FilesChanged
+		a.mu.Unlock()
+		// Only a followed worktree has a runner; an event for another does nothing.
+		if r := a.existingRunner(fc.Path); r != nil && (len(fc.Files) > 0 || fc.Truncated) {
+			files := make([]string, len(fc.Files))
+			for i, f := range fc.Files {
+				files[i] = f.Path
+			}
+			r.filesChanged(files, fc.Truncated)
+		}
+		return
 	case len(p.WorktreeRemoved) > 0:
 		var w struct {
 			Path string `json:"path"`

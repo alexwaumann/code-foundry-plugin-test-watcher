@@ -228,12 +228,12 @@ func TestTerminalRunScrollback(t *testing.T) {
 	f.h.SetTerminalText(term, strings.Join(lines[len(lines)-24:], "\n"))
 	f.h.SetTerminalScrollback(term, whole)
 	f.h.WaitFor(5*time.Second, func(*plugintest.Host) bool {
-		cur, _, _, _ := f.a.existingRunner(f.dir).snapshot(false)
+		cur, _, _, _, _ := f.a.existingRunner(f.dir).snapshot(false)
 		return len(cur.Failures) == 1
 	})
 	f.h.ExitTerminal(term, 1)
 	f.waitPill("failing")
-	cur, _, _, _ := f.a.existingRunner(f.dir).snapshot(true)
+	cur, _, _, _, _ := f.a.existingRunner(f.dir).snapshot(true)
 	if len(cur.Failures) != 1 || cur.Failures[0].Title() != "TestEarly (example.com/calc)" || cur.Exit != 1 {
 		t.Errorf("run = %+v failures %+v", cur.State, cur.Failures)
 	}
@@ -277,7 +277,7 @@ func TestTerminalStopScrollback(t *testing.T) {
 	f.h.WaitFor(5*time.Second, func(h *plugintest.Host) bool { return len(h.CreatedTerminals()) == 1 })
 	f.h.SetTerminalScrollback(f.h.PluginTerminals()[0].TerminalID, "=== RUN   TestSlow")
 	f.h.WaitFor(5*time.Second, func(*plugintest.Host) bool {
-		cur, _, _, _ := f.a.existingRunner(f.dir).snapshot(true)
+		cur, _, _, _, _ := f.a.existingRunner(f.dir).snapshot(true)
 		return len(cur.Lines) == 2
 	})
 	if res := f.command("stop", nil); res.Message != "Stopped the test run" {

@@ -37,8 +37,15 @@ failing tests changes (another test fails, or one of them passes while others st
 fail), and after a passing run any failure raises it again. With watching off, only
 Run now flags the thread.
 
-How it runs: 2 s after files stop changing (debounced), one run per worktree at a time;
-a newer change stops the run in progress (its whole process group) and starts again. The
+How it runs: Code Foundry tells the plugin which files changed in a thread's worktree
+(the `project.worktreeFilesChanged` event, about 1 s after the last write: the daemon
+collects a second of edits into one event), and the plugin runs the tests 2 s after the
+changes stop (debounced), so about 3 s after you save. Gitignored files never count, so
+write what your tests produce (coverage files, generated fixtures, build output) to
+ignored paths: a run that writes a file git sees changes the worktree and runs again.
+One run per worktree at a time; a newer change stops the run in progress (its whole
+process group) and starts again. A commit or a branch switch (the worktree's head or
+branch moves) runs them too. The plugin polls nothing and runs no `git` itself. The
 command runs in the worktree with your login shell (`$SHELL -lc`) and `CI=true` (no watch
 modes). In a terminal, the plugin reads the terminal's whole output, its scrollback and
 screen (Code Foundry keeps the last 10,000 rows by default; the plugin reads at most the
@@ -88,7 +95,7 @@ line. The flag reason does not (80 characters).
 
 ```
 code-foundry plugin install test-watcher --enable
-code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.2.0 --enable   # a release directly
+code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.3.0 --enable   # a release directly
 ```
 
 ## Permissions and why
@@ -96,7 +103,7 @@ code-foundry plugin install alexwaumann/code-foundry-plugin-test-watcher@v0.2.0 
 | Permission | Why |
 |---|---|
 | `commands: thread.send` | *Send to Claude* and *Send failures to Claude* post the failure excerpt into the thread. Nothing else is invoked. |
-| `events: project, threads` | `project`: worktree changes (status counts, commits, branch switches) and removed worktrees. `threads`: which worktree and project each thread works in, and when a thread is archived or removed. |
+| `events: project, threads` | `project`: the files that changed in a worktree, worktree changes (status counts, commits, branch switches) and removed worktrees. `threads`: which worktree and project each thread works in, and when a thread is archived or removed. |
 | `threadStatus` | The red "Tests failing" flag on the thread while its tests fail (until they pass or you clear it). |
 | `terminals` | The Output tab's terminal: each run is a terminal the plugin owns, in the thread's worktree. Disabling the plugin closes them. |
 
@@ -137,7 +144,10 @@ make test                                               # plugintest unit tests
 make dist                                               # release tarballs + SHA256SUMS
 ```
 
-The tests cover the debounce and newest-wins (process groups included), the `go test`,
+The tests cover the files events (decoding a captured one, routing to the worktree's
+runner, nothing for a worktree no followed thread works in, directories, truncated
+lists, one run for a files event and the status change it caused, a resync snapshot,
+an archived thread's worktree let go), the debounce and newest-wins (process groups included), the `go test`,
 vitest and jest parsers on captured output (`testdata/`), the views for failing and
 passing runs, output streaming and caps, terminal runs against plugintest's fake
 terminals (the argv, the scrollback read and the `script(1)` fallback, the exit status,
@@ -147,12 +157,37 @@ flag lifecycle (sticky; cleared by a pass, Stop, watching off or the user; not r
 for the same failures, across restarts too), the 4 KB excerpt, the command form and the edge states (no command,
 command not found, worktree deleted).
 
-Worktree events only fire when a worktree's status counts change, so an edit to a file
-that is already modified does not produce one. The plugin also fingerprints each watched
-worktree every 2 s (`git status` plus size and mtime of each changed file) to catch those.
+Changes come from `project.worktreeFilesChanged` (`onProject` in `events.go`): it lists
+the worktree's changed files (an edit to a file that is already modified too, which
+moves no status counts), without gitignored paths, and only for worktrees with a live
+thread (not archived or snoozed), which a followed thread's is. Its `path` picks the
+runner; its files are what "Changed since" counts (`truncated`: more than 500 changed,
+shown as "500+ files"). A second `project` snapshot means the plugin fell behind and may
+have missed some: each followed worktree runs once.
 
 The Output tab is one node (`outputNode` in `surface.go`): a `terminal` node while the
 run's terminal is open, else the log node.
+
+### A real run, 0.3.0 (Code Foundry dev build 363eda43, isolated home, a scratch Go module)
+
+`.gitignore` has `*.out` and `coverage/`; edits with `sed -i`, the flag read every 0.25 s.
+
+```
+$ sed -i '' 's/got != 5/got != 6/' calc_test.go                  # 22:03:00.660
+22:03:01.940 log debug  files changed dir=…/calc files=2 truncated=false   # calc_test.go and sed's temp file
+22:03:03.945 log info   test run started command=go test ./... dir=…/calc run=9
+22:03:04.189 host       flag error on s-4533632ac1b2: Tests failing: TestAdd
+$ sed -i '' 's/got != 6 {/got != 7 {/' calc_test.go              # 22:03:06.420, already modified: no status change
+22:03:07.448 log debug  files changed dir=…/calc files=2 truncated=false
+22:03:09.455 log info   test run started command=go test ./... dir=…/calc run=10
+22:03:09.827 host       flag error on s-4533632ac1b2: Tests failing: TestAdd and 1 more
+$ mkdir -p coverage && echo x > coverage/c.out && echo y > cover.out   # 22:03:12.010, ignored: nothing
+$ git checkout calc_test.go                                      # 22:03:18.177
+22:03:19.218 log debug  files changed dir=…/calc files=1 truncated=false
+22:03:21.256 log info   test run started command=go test ./... dir=…/calc run=11
+22:03:21.494 host       flag cleared on s-4533632ac1b2
+$ # 10 s later: no further run (go test writes nothing in the module)
+```
 
 ### A real run, 0.2.0 (Code Foundry dev build 363eda43, isolated home, a scratch Go module)
 
@@ -252,6 +287,19 @@ thread test watcher run (s-f9b8cf835989) has no flags
 ```
 
 ## Changelog
+
+### 0.3.0
+
+- **No more polling**: the plugin reacts to Code Foundry's per-file worktree events
+  (`project.worktreeFilesChanged`) instead of fingerprinting each watched worktree every
+  2 s with `git status` and file mtimes. Tests run about 3 s after the last save (the
+  daemon's 1 s window, then the 2 s debounce); gitignored files never start a run, so
+  keep what your tests write ignored. "Changed since" counts the files the events
+  listed.
+- Needs Code Foundry v0.19.0-tip.79 or later for `worktreeFilesChanged` (code-foundry
+  #211). An older one sends only status-count changes, so a second edit to an already
+  modified file runs nothing there.
+- Same permissions as 0.2.0, so updating keeps it enabled.
 
 ### 0.2.0
 
