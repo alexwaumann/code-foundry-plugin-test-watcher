@@ -4,11 +4,9 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -136,20 +134,18 @@ type runner struct {
 	timer   *time.Timer
 	flush   *time.Timer
 	changed map[string]bool // files changed since the latest run started
-	print   map[string]string
-	gone    bool
-	closed  bool
+	// more: a files event since the latest run started was truncated (more files
+	// changed than it listed).
+	more   bool
+	gone   bool
+	closed bool
 	// term is the plugin terminal of the latest terminal run, kept open (exited, its
 	// output still on screen) until the next run replaces it.
 	term string
 }
 
 func newRunner(a *app, dir string) *runner {
-	r := &runner{a: a, dir: dir, changed: map[string]bool{}}
-	if a.cfg.poll > 0 {
-		go r.pollLoop()
-	}
-	return r
+	return &runner{a: a, dir: dir, changed: map[string]bool{}}
 }
 
 // trigger notes a change in the worktree: with watching on it (re)starts the debounce,
@@ -200,7 +196,7 @@ func (r *runner) start(trigger string) (*run, error) {
 	nr.addLine("$ "+command, ui.ToneMuted)
 	done := make(chan struct{})
 	r.cur, r.cancel, r.done = nr, cancel, done
-	r.changed = map[string]bool{}
+	r.changed, r.more = map[string]bool{}, false
 	r.mu.Unlock()
 	r.a.changed(r.dir)
 	go func() {
@@ -426,15 +422,30 @@ func (r *runner) renderSoonLocked() {
 	}
 }
 
-// snapshot copies the runner's state for a view; lines only when asked.
-func (r *runner) snapshot(withLines bool) (cur, result *runSnap, changed int, gone bool) {
+// filesChanged records the files a worktreeFilesChanged event listed (more: it was
+// truncated) and triggers a run.
+func (r *runner) filesChanged(files []string, more bool) {
+	r.mu.Lock()
+	for _, p := range files {
+		r.changed[p] = true
+	}
+	r.more = r.more || more
+	r.mu.Unlock()
+	r.a.log().Debug("files changed", "dir", r.dir, "files", len(files), "truncated", more)
+	r.a.changed(r.dir)
+	r.trigger("change")
+}
+
+// snapshot copies the runner's state for a view; lines only when asked. more: more
+// files changed than changed counts.
+func (r *runner) snapshot(withLines bool) (cur, result *runSnap, changed int, more, gone bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	cur = r.cur.snap(withLines)
 	if r.result != nil && r.result != r.cur {
 		result = r.result.snap(false)
 	}
-	return cur, result, len(r.changed), r.gone
+	return cur, result, len(r.changed), r.more, r.gone
 }
 
 // findRun returns the current or last result run by id, with its lines.
@@ -455,85 +466,4 @@ func firstWord(s string) string {
 		return s
 	}
 	return f[0]
-}
-
-// pollLoop notices file changes the worktree events do not report (an edit to a file
-// that is already modified changes no counts): every poll interval it fingerprints the
-// changed and untracked files (git status, then size and mtime of each).
-func (r *runner) pollLoop() {
-	t := time.NewTicker(r.a.cfg.poll)
-	defer t.Stop()
-	for range t.C {
-		r.mu.Lock()
-		stop, gone := r.closed, r.gone
-		r.mu.Unlock()
-		if stop || r.a.forgotten(r.dir) {
-			return
-		}
-		if gone {
-			continue
-		}
-		print, err := fingerprint(r.dir)
-		if err != nil {
-			if _, serr := os.Stat(r.dir); serr != nil {
-				r.a.worktreeGone(r.dir)
-			}
-			continue
-		}
-		r.mu.Lock()
-		first := r.print == nil
-		var diff []string
-		for p, v := range print {
-			if r.print[p] != v {
-				diff = append(diff, p)
-			}
-		}
-		for p := range r.print {
-			if _, ok := print[p]; !ok {
-				diff = append(diff, p)
-			}
-		}
-		r.print = print
-		if !first {
-			for _, p := range diff {
-				r.changed[p] = true
-			}
-		}
-		r.mu.Unlock()
-		if first || len(diff) == 0 {
-			continue
-		}
-		r.a.changed(r.dir)
-		r.trigger("change")
-	}
-}
-
-// fingerprint maps each changed or untracked file of a worktree to its size and mtime.
-func fingerprint(dir string) (map[string]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", dir, "status", "--porcelain=v1", "-z", "--untracked-files=all")
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("git status: %w", err)
-	}
-	print := map[string]string{}
-	entries := strings.Split(string(out), "\x00")
-	for i := 0; i < len(entries); i++ {
-		e := entries[i]
-		if len(e) < 4 {
-			continue
-		}
-		xy, path := e[:2], e[3:]
-		if xy[0] == 'R' || xy[0] == 'C' {
-			i++ // the rename's source follows
-		}
-		stamp := xy
-		if fi, err := os.Lstat(filepath.Join(dir, path)); err == nil {
-			stamp = fmt.Sprintf("%s %d %d", xy, fi.Size(), fi.ModTime().UnixNano())
-		}
-		print[path] = stamp
-	}
-	return print, nil
 }

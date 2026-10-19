@@ -16,7 +16,6 @@ import (
 // config holds what tests shorten or replace.
 type config struct {
 	debounce time.Duration // quiet time after a change before a run starts
-	poll     time.Duration // how often watched worktrees are fingerprinted; 0: never
 	now      func() time.Time
 	shell    func() (string, string) // the shell and its flag that run the command
 	home     func() string           // the home directory (terminal runs need the worktree under it)
@@ -31,7 +30,6 @@ type config struct {
 func defaultConfig() config {
 	return config{
 		debounce:   2 * time.Second,
-		poll:       2 * time.Second,
 		now:        time.Now,
 		shell:      loginShell,
 		home:       func() string { home, _ := os.UserHomeDir(); return home },
@@ -121,9 +119,12 @@ type app struct {
 	worktrees map[string]worktreeInfo
 	runners   map[string]*runner
 	surfaces  map[string]*testsSurface
-	flagged   map[string]bool        // threads this plugin's flag is up on, as far as it knows
-	wakeSubs  map[string]string      // tests-finished subscription → its thread
-	lingers   map[string]*time.Timer // thread → the end of its wake-only follow
+	flagged   map[string]bool // threads this plugin's flag is up on, as far as it knows
+	// projectSynced: the project source's first snapshot came; a later one is a resync
+	// (the plugin fell behind and may have missed files events).
+	projectSynced bool
+	wakeSubs      map[string]string      // tests-finished subscription → its thread
+	lingers       map[string]*time.Timer // thread → the end of its wake-only follow
 
 	// Terminal exits (terminal/exited) by terminal: a run waiting for one, or an exit
 	// that came before the run started waiting.
@@ -342,7 +343,7 @@ func (a *app) watched(dir string) bool {
 	return false
 }
 
-// forgotten: no followed thread works in dir any more (its poller ends).
+// forgotten: no followed thread works in dir any more (its runner ends).
 func (a *app) forgotten(dir string) bool {
 	if len(a.threadsOn(dir)) > 0 {
 		return false

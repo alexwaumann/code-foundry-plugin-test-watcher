@@ -122,6 +122,7 @@ type model struct {
 	flagged                      bool
 	cur, result                  *runSnap
 	changed                      int
+	changedMore                  bool // more files changed than changed counts
 	gone                         bool
 	tab                          string
 	formReset                    int
@@ -148,7 +149,7 @@ func (s *testsSurface) model() model {
 	m.watch = s.a.st.watching(s.thread)
 	m.flagged = s.a.isFlagged(s.thread)
 	if r := s.a.existingRunner(dir); r != nil {
-		m.cur, m.result, m.changed, m.gone = r.snapshot(m.tab == tabOutput)
+		m.cur, m.result, m.changed, m.changedMore, m.gone = r.snapshot(m.tab == tabOutput)
 	}
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		m.gone = true
@@ -466,6 +467,8 @@ func statusNodes(m model) []ui.Node {
 	}
 	changed := "none"
 	switch {
+	case m.changedMore:
+		changed = strconv.Itoa(m.changed) + "+ files" // a burst the event did not list in full
 	case m.changed == 1:
 		changed = "1 file"
 	case m.changed > 1:
@@ -651,7 +654,7 @@ func (a *app) sendFailures(ctx context.Context, h *pluginsdk.Host, t threadInfo,
 	}
 	var rn *runSnap
 	if id < 0 {
-		cur, result, _, _ := r.snapshot(false)
+		cur, result, _, _, _ := r.snapshot(false)
 		if f := failing(model{cur: cur, result: result}); f != nil {
 			rn = r.findRun(f.ID)
 		}

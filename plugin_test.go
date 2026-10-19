@@ -65,7 +65,6 @@ type fixture struct {
 func testConfig() config {
 	return config{
 		debounce:   150 * time.Millisecond,
-		poll:       0,
 		now:        time.Now,
 		shell:      func() (string, string) { return "/bin/sh", "-c" },
 		home:       func() string { return "" },
@@ -730,7 +729,7 @@ func TestTerminalRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.h.WaitFor(5*time.Second, func(*plugintest.Host) bool {
-		cur, _, _, _ := f.a.existingRunner(f.dir).snapshot(false)
+		cur, _, _, _, _ := f.a.existingRunner(f.dir).snapshot(false)
 		return len(cur.Failures) == 1
 	})
 	f.h.ExitTerminal(term, 1)
@@ -785,7 +784,7 @@ func TestTerminalStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.h.WaitFor(5*time.Second, func(*plugintest.Host) bool {
-		cur, _, _, _ := f.a.existingRunner(f.dir).snapshot(true)
+		cur, _, _, _, _ := f.a.existingRunner(f.dir).snapshot(true)
 		return len(cur.Lines) == 2
 	})
 	if res := f.command("stop", nil); res.Message != "Stopped the test run" {
@@ -977,5 +976,209 @@ func TestFailSet(t *testing.T) {
 		if got := failSet(tt.x) == failSet(tt.y); got != tt.same {
 			t.Errorf("failSet(%+v) == failSet(%+v): %v, want %v", tt.x, tt.y, got, tt.same)
 		}
+	}
+}
+
+// filesEvent is a project.worktreeFilesChanged event for dir, as the daemon sends it
+// (captured with code-foundry events --json --source project); files are path:OP pairs.
+func filesEvent(dir string, truncated bool, files ...string) string {
+	list := make([]string, len(files))
+	for i, f := range files {
+		path, op, _ := strings.Cut(f, ":")
+		list[i] = fmt.Sprintf(`{"path":%q,"op":"FILE_OP_%s"}`, path, op)
+	}
+	trunc := ""
+	if truncated {
+		trunc = `,"truncated":true`
+	}
+	return fmt.Sprintf(`{"project":{"worktreeFilesChanged":{"projectId":"p1","path":%q,"files":[%s]%s}},"seq":"3","epoch":"1564ea52ddca"}`, dir, strings.Join(list, ","), trunc)
+}
+
+func (f *fixture) files(truncated bool, files ...string) {
+	f.t.Helper()
+	f.event(filesEvent(f.dir, truncated, files...), false)
+}
+
+// runs counts the runs of a command that logs each one ("echo ran >> log").
+func (f *fixture) runs() int { return strings.Count(f.read("log"), "ran") }
+
+// changedSince is the Status tab's "Changed since" value.
+func (f *fixture) changedSince() string {
+	n := node(f.view(), "facts")
+	if n == nil || n.Pairs == nil {
+		return ""
+	}
+	for _, p := range n.Pairs.Items {
+		if p.Key == "p-changed" && p.Value != nil {
+			return p.Value.Text
+		}
+	}
+	return ""
+}
+
+// A real worktreeFilesChanged line decodes; its files are what changed.
+func TestFilesEventDecodes(t *testing.T) {
+	line := `{"project":{"worktreeFilesChanged":{"projectId":"fc732779b5bd","path":"/Users/alex/.cf-proof-tw/scratch/calc","files":[{"path":"sub/","op":"FILE_OP_REMOVED"},{"path":"sub/s.go","op":"FILE_OP_REMOVED"}]}},"seq":"6","epoch":"1564ea52ddca"}`
+	var e event
+	if err := json.Unmarshal([]byte(line), &e); err != nil {
+		t.Fatal(err)
+	}
+	fc := e.Project.FilesChanged
+	if fc == nil || fc.Path != "/Users/alex/.cf-proof-tw/scratch/calc" || fc.ProjectID != "fc732779b5bd" || fc.Truncated {
+		t.Fatalf("decoded %+v", fc)
+	}
+	if len(fc.Files) != 2 || fc.Files[0].Path != "sub/" || fc.Files[0].Op != "FILE_OP_REMOVED" || fc.Files[1].Path != "sub/s.go" {
+		t.Errorf("files = %+v", fc.Files)
+	}
+	if e.Project.WorktreeUpdated != nil || e.Project.Snapshot != nil {
+		t.Errorf("decoded as another change: %+v", e.Project)
+	}
+}
+
+// A files event runs the tests (debounced) and the Status tab counts the files; an edit
+// to the same file again, which changes no status counts, runs them again. Directories
+// (a trailing "/") and a truncated event count as changes too.
+func TestFilesEventRuns(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		files     []string
+		truncated bool
+		changed   string
+	}{
+		{"one file", []string{"calc_test.go:MODIFIED"}, false, "1 file"},
+		{"several", []string{"a.go:CREATED", "b.go:RENAMED", "c.go:REMOVED"}, false, "3 files"},
+		{"removed directory", []string{"sub/:REMOVED", "sub/s.go:REMOVED"}, false, "2 files"},
+		{"renamed directory", []string{"pkg/:REMOVED", "pkg2/:RENAMED"}, false, "2 files"},
+		{"truncated", []string{"pkg/f0001.txt:CREATED", "pkg/f0002.txt:CREATED"}, true, "2+ files"},
+		{"truncated, no list", nil, true, "0+ files"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := start(t, "")
+			f.open()
+			f.command("set-command", map[string]string{"command": "echo ran >> log"})
+			// Watching off: the files are counted, nothing runs.
+			f.command("toggle-watch", nil)
+			f.files(tc.truncated, tc.files...)
+			f.h.WaitFor(5*time.Second, func(*plugintest.Host) bool { return f.changedSince() == tc.changed })
+			// Watching on: two events within the debounce make one run, and the run
+			// starts the count again.
+			f.command("toggle-watch", nil)
+			f.files(tc.truncated, tc.files...)
+			f.files(tc.truncated, tc.files...)
+			f.eventually("the files event runs the tests", func() bool { return f.runs() == 1 })
+			f.waitPill("passing")
+			if got := f.changedSince(); got != "none" {
+				t.Errorf("changed since after the run: %q", got)
+			}
+			// The same files again (no status counts move): another run.
+			f.files(tc.truncated, tc.files...)
+			f.eventually("the same files again run again", func() bool { return f.runs() == 2 })
+			time.Sleep(400 * time.Millisecond)
+			if n := f.runs(); n != 2 {
+				t.Errorf("%d runs, want 2", n)
+			}
+		})
+	}
+}
+
+// An event with no files and not truncated does nothing.
+func TestFilesEventEmpty(t *testing.T) {
+	f := start(t, "")
+	f.command("set-command", map[string]string{"command": "echo ran >> log"})
+	f.files(false)
+	time.Sleep(400 * time.Millisecond)
+	if f.runs() != 0 {
+		t.Fatal("an empty files event ran the tests")
+	}
+}
+
+// A files event and the worktreeUpdated whose counts it moved (the daemon sends both
+// for a first edit) make one run, not two.
+func TestFilesEventAndCountsOneRun(t *testing.T) {
+	f := start(t, "")
+	f.command("set-command", map[string]string{"command": "echo ran >> log"})
+	f.files(false, "calc_test.go:MODIFIED")
+	f.change()
+	f.eventually("a run", func() bool { return f.runs() == 1 })
+	time.Sleep(400 * time.Millisecond)
+	if n := f.runs(); n != 1 {
+		t.Errorf("%d runs, want 1", n)
+	}
+}
+
+// Events go to the runner of their worktree: with two followed threads in two
+// worktrees, an event for one runs only its tests; one for a worktree no followed
+// thread works in runs nothing.
+func TestFilesEventRouting(t *testing.T) {
+	f := start(t, "")
+	other := filepath.Join(filepath.Dir(f.dir), "other")
+	stranger := filepath.Join(filepath.Dir(f.dir), "stranger")
+	for _, d := range []string{other, stranger} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.event(fmt.Sprintf(`{"threadList":{"snapshot":{"threads":[{"id":%q,"projectId":"p1","worktreePath":%q},{"id":"s-2","projectId":"p1","worktreePath":%q},{"id":"s-3","projectId":"p1","worktreePath":%q}]}},"epoch":"e"}`, thread, f.dir, other, stranger), true)
+	f.command("set-command", map[string]string{"command": "echo ran >> log"}) // the project's: both worktrees
+	if _, err := f.h.Command(f.ctx, "run", map[string]string{"thread": "s-2"}, pluginsdk.UiContext{ThreadID: "s-2"}); err != nil {
+		t.Fatal(err) // follows s-2 (s-3 is never followed)
+	}
+	logOf := func(dir string) int {
+		data, _ := os.ReadFile(filepath.Join(dir, "log"))
+		return strings.Count(string(data), "ran")
+	}
+	f.eventually("s-2's run now", func() bool { return logOf(other) == 1 })
+
+	f.event(filesEvent(other, false, "x_test.go:MODIFIED"), false)
+	f.eventually("other runs", func() bool { return logOf(other) == 2 })
+	f.event(filesEvent(stranger, false, "x_test.go:MODIFIED"), false)
+	f.event(filesEvent(filepath.Join(filepath.Dir(f.dir), "unknown"), true), false)
+	time.Sleep(400 * time.Millisecond)
+	if n, m, s := f.runs(), logOf(other), logOf(stranger); n != 0 || m != 2 || s != 0 {
+		t.Errorf("runs: followed %d (want 0), other %d (want 2), stranger %d (want 0)", n, m, s)
+	}
+	if f.a.existingRunner(stranger) != nil {
+		t.Error("a runner for a worktree no followed thread works in")
+	}
+}
+
+// A project snapshot after the first (a resync: the plugin fell behind) runs each
+// followed worktree once; the first, at start, runs nothing.
+func TestProjectResyncRuns(t *testing.T) {
+	f := start(t, "")
+	f.command("set-command", map[string]string{"command": "echo ran >> log"})
+	time.Sleep(400 * time.Millisecond)
+	if f.runs() != 0 {
+		t.Fatal("the first snapshot ran the tests")
+	}
+	snap := f.worktreeEvent(`"snapshot":{"projects":[{"id":"p1","path":%q,"name":"scratch","git":true,"worktrees":[{"projectId":"p1","path":%q,"branch":"main","head":"aaa","status":{}}]}]}`, f.dir, f.dir)
+	f.event(snap, true)
+	f.eventually("the resync runs the tests", func() bool { return f.runs() == 1 })
+	time.Sleep(400 * time.Millisecond)
+	if n := f.runs(); n != 1 {
+		t.Errorf("%d runs, want 1", n)
+	}
+	// With watching off, a resync runs nothing.
+	f.command("toggle-watch", nil)
+	f.event(snap, true)
+	time.Sleep(400 * time.Millisecond)
+	if n := f.runs(); n != 1 {
+		t.Errorf("%d runs with watching off, want 1", n)
+	}
+}
+
+// An archived thread's worktree lets its runner go (no poll does it any more).
+func TestArchivedThreadLetsRunnerGo(t *testing.T) {
+	f := start(t, "")
+	f.command("set-command", map[string]string{"command": "echo ran >> log"})
+	if f.a.existingRunner(f.dir) == nil {
+		t.Fatal("no runner for the followed thread")
+	}
+	f.event(fmt.Sprintf(`{"threadList":{"updated":{"id":%q,"projectId":"p1","worktreePath":%q,"archivedAt":"2026-10-18T00:00:00Z"}},"epoch":"e"}`, thread, f.dir), false)
+	f.eventually("the runner goes", func() bool { return f.a.existingRunner(f.dir) == nil })
+	f.files(false, "calc_test.go:MODIFIED")
+	time.Sleep(400 * time.Millisecond)
+	if f.runs() != 0 {
+		t.Error("a files event ran an archived thread's tests")
 	}
 }

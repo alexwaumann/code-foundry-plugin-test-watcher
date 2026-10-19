@@ -94,7 +94,7 @@ func (a *app) userClearFlag(h *pluginsdk.Host, t threadInfo) (bool, error) {
 	if a.st.flagSet(t.ID) == "" {
 		// A flag from before this version, or none: remember the failures shown now.
 		if r := a.existingRunner(t.WorktreePath); r != nil {
-			cur, res, _, _ := r.snapshot(false)
+			cur, res, _, _, _ := r.snapshot(false)
 			if rn := failing(model{cur: cur, result: res}); rn != nil && rn.State == stateFailed {
 				a.saveFlagSet(t.ID, failSet(rn))
 			}
